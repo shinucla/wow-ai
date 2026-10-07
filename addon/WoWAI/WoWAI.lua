@@ -1,20 +1,19 @@
--- WoWAI: talk to local coding agents (Claude Code, Codex, Grok) from inside WoW,
--- without reloading.
+-- WoWAI: talk to a local LLM / coding-agent bridge from inside WoW 3.3.5a,
+-- without reloading on every message.
 --
 -- The WoW sandbox has no network and no file reads at runtime. Two doors remain open:
 --
 --   OUT ("pixel" mode): pending messages are drawn as a strip of colored squares in
 --        the top-left corner of the screen until the bridge acknowledges them.
---        bridge.js screen-captures that corner and decodes it. Nothing touches the game.
+--        The companion bridge screen-captures that corner and decodes it.
 --   IN:  load-on-demand addons read their files from disk at the moment they load.
---        The bridge writes the latest replies for every chat into a pool of pre-made
---        slot addons (WoWAI_S001..S200); we load a fresh slot from a timer.
+--        The bridge writes replies into a pool of pre-made slot addons
+--        (WoWAI_I##_S001..); we load a fresh slot from a timer.
 --        Each slot is single-use per session; a /reload frees them all.
 --   Fallback ("reload" mode): SavedVariables + Inbox.lua, a ReloadUI() per step.
 --
--- Chats: each chat is its own agent session (like a separate terminal) with its own
--- folder, agent, history and pending message. The bridge runs them in parallel.
--- Everything here is plain addon API. No automation, no memory reading.
+-- Target client: World of Warcraft 3.3.5a (Interface 30300). See Compat.lua.
+-- Chats: each chat is its own agent session with its own folder, history and pending message.
 
 local ADDON_NAME = ...
 local WoWAI = {}
@@ -26,7 +25,6 @@ local MAX_HISTORY = 200
 local MAX_CHATS = 16
 
 local SLOT_COUNT = 200
-local SLOT_PREFIX = "WoWAI_S"
 local ACT_MAX = 60 -- heartbeat files per message (act/NNN/01..60.wav)
 local PRESENCE_MAX = 2000 -- presence/0001..2000.wav, one flipped by the bridge every 30 s
 local STRIP_TRIES = 3 -- re-show an unacknowledged message this many times before falling back
@@ -199,6 +197,9 @@ local function InitDB()
 	if s.autoRefresh == nil then s.autoRefresh = true end
 	if s.signal == nil then s.signal = true end
 	if s.context == nil then s.context = true end -- tell the agent about the character, zone, etc.
+	-- Opt-in auto-reply toggles (bridge returns JSON reply|skip; nothing sent on skip).
+	if s.autoWhisper == nil then s.autoWhisper = false end
+	if s.autoParty == nil then s.autoParty = false end
 	-- How much of each reply to print in the game chat. "summary" (the agent's
 	-- closing TL;DR lines) replaced "full" as the default; an install that still
 	-- has the old default saved moves over once, any other choice is kept.
@@ -212,6 +213,11 @@ local function InitDB()
 	s.cwd = s.cwd or DEFAULT_CWD
 	s.width = s.width or 780
 	s.height = s.height or 500
+	-- Multi-client: which instance this window is (1..8). Must match the bridge's
+	-- left→right window order so replies/signals stay on this client's files.
+	s.instance = tonumber(s.instance) or 1
+	if s.instance < 1 then s.instance = 1 end
+	if s.instance > 8 then s.instance = 8 end
 	db.lastSeq = db.lastSeq or 0
 	-- Chats deleted in game that the bridge hasn't confirmed forgetting yet.
 	db.forget = db.forget or {}
@@ -255,8 +261,33 @@ local function AddHistory(chat, role, text, id, denied, agent, macros)
 	end
 end
 
+local function InstanceNum()
+	local n = db and db.settings and tonumber(db.settings.instance) or 1
+	if n < 1 then n = 1 end
+	if n > 8 then n = 8 end
+	return n
+end
+
+local function InstanceRoot()
+	return string.format("Interface\\AddOns\\WoWAI\\i%02d", InstanceNum())
+end
+
+local function AddonLoaded(name)
+	if C_AddOns and C_AddOns.IsAddOnLoaded then
+		return C_AddOns.IsAddOnLoaded(name)
+	end
+	return IsAddOnLoaded and IsAddOnLoaded(name)
+end
+
+local function LoadAddon(name)
+	if C_AddOns and C_AddOns.LoadAddOn then
+		return C_AddOns.LoadAddOn(name)
+	end
+	return LoadAddOn(name)
+end
+
 local function SlotName(i)
-	return string.format("%s%03d", SLOT_PREFIX, i)
+	return string.format("WoWAI_I%02d_S%03d", InstanceNum(), i)
 end
 
 local function SlotNumber(id)
@@ -278,36 +309,23 @@ local function SafeReload()
 	ReloadUI()
 end
 
--- ReloadUI() only works from a hardware event (a keypress or click), never from
--- a timer. So the automatic reload piggybacks on the player's own next keypress
--- once the interval has elapsed. The key still reaches the game normally.
+-- ReloadUI() only works from a hardware event (keypress/click), never a timer.
+-- Retail/Forever used a keyboard catcher + SetPropagateKeyboardInput so the next
+-- keypress could ReloadUI without eating the key. On 3.3.5a that API is missing
+-- or a no-op: EnableKeyboard + Show steals WASD/binds/chat. This build is
+-- Interface 30300 only — never arm a keyboard frame. Use Reload / /wow-ai reload.
 local keyCatcher = CreateFrame("Frame", "WoWAIKeyCatcher", UIParent)
 keyCatcher:Hide()
-keyCatcher:EnableKeyboard(true)
-keyCatcher:SetScript("OnKeyDown", function(self, key)
-	if db and AnyPending() and db.settings.autoRefresh
-		and GetTime() >= (WoWAI.nextAutoRefresh or 0)
-		and not InCombatLockdown() then
-		self:Hide()
-		ReloadUI()
-	end
-end)
+keyCatcher:EnableKeyboard(false)
+keyCatcher:SetScript("OnKeyDown", nil)
+keyCatcher:SetScript("OnKeyUp", nil)
 
--- Arm the keypress reload. In pixel mode this is only used once the slot pool
--- is exhausted (a reload frees every slot) or the slots are not installed.
 function WoWAI.ArmAutoRefresh()
 	keyCatcher:Hide()
+	keyCatcher:EnableKeyboard(false)
 	if not AnyPending() or not db.settings.autoRefresh then return end
 	if db.settings.mode == "pixel" and not (run.slotsExhausted or run.slotsMissing or run.pixelFailed) then return end
-	-- Propagation can't be changed in combat. Never show the catcher without it,
-	-- or it would eat every keypress. PLAYER_REGEN_ENABLED re-arms after combat.
-	if not keyCatcher.propagates then
-		if InCombatLockdown() or not keyCatcher.SetPropagateKeyboardInput then return end
-		keyCatcher:SetPropagateKeyboardInput(true)
-		keyCatcher.propagates = true
-	end
 	WoWAI.nextAutoRefresh = GetTime() + db.settings.interval
-	keyCatcher:Show()
 end
 
 ---------------------------------------------------------------------------
@@ -317,19 +335,46 @@ end
 local strip
 local cellPool = {}
 
+-- Keep CELL UI units ≈ CELL physical pixels after window resize / maximize.
+-- 3.3.5a has no SetIgnoreParentScale; cancel UIParent's effective scale and
+-- refresh whenever that scale changes (resize changes it).
+local function DesiredStripScale()
+	local ps = (UIParent and UIParent.GetEffectiveScale and UIParent:GetEffectiveScale()) or 1
+	if ps < 0.01 then ps = 1 end
+	if strip and strip.SetIgnoreParentScale then
+		return 1
+	end
+	-- Cancel parent scale so strip cells stay ~CELL framebuffer pixels at any
+	-- resolution (1080p…4K). Clamp so extreme scales are still applied.
+	local want = 1 / ps
+	if want < 0.05 then want = 0.05 end
+	if want > 8 then want = 8 end
+	return want
+end
+
+local function ApplyStripScale(s)
+	s = s or strip
+	if not s then return end
+	local want = DesiredStripScale()
+	local ps = (UIParent and UIParent.GetEffectiveScale and UIParent:GetEffectiveScale()) or 1
+	if run.stripScale == want and run.stripParentScale == ps then return end
+	if s.SetIgnoreParentScale then
+		s:SetIgnoreParentScale(true)
+	end
+	s:SetScale(want)
+	run.stripScale = want
+	run.stripParentScale = ps
+end
+
 local function EnsureStrip()
-	if strip then return strip end
+	if strip then
+		ApplyStripScale(strip)
+		return strip
+	end
 	strip = CreateFrame("Frame", "WoWAIStrip", UIParent)
 	strip:SetFrameStrata("TOOLTIP")
 	strip:SetFrameLevel(10000)
-	-- Scale so that one UI unit is exactly one physical pixel (see Blizzard's PixelUtil).
-	local physH = 1080
-	if GetPhysicalScreenSize then
-		local _, h = GetPhysicalScreenSize()
-		physH = h or physH
-	end
-	if strip.SetIgnoreParentScale then strip:SetIgnoreParentScale(true) end
-	strip:SetScale(768 / physH)
+	ApplyStripScale(strip)
 	strip:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 0, 0)
 	strip:SetSize(CELLS_PER_ROW * CELL, MAX_ROWS * CELL)
 	strip:Hide()
@@ -344,6 +389,7 @@ end
 local function ShowStrip(id, payload)
 	local cells = Codec.Encode(id % 65536, payload)
 	local s = EnsureStrip()
+	ApplyStripScale(s)
 	local rows = math.ceil(#cells / CELLS_PER_ROW)
 	local total = rows * CELLS_PER_ROW
 	for i = 1, total do
@@ -357,7 +403,7 @@ local function ShowStrip(id, payload)
 			cellPool[i] = t
 		end
 		local cr, cg, cb = Codec.CellColor(cells[i] or 0)
-		t:SetColorTexture(cr, cg, cb, 1)
+		WoWAI_Compat.SetSolidColor(t, cr, cg, cb, 1)
 		t:Show()
 	end
 	for i = total + 1, #cellPool do
@@ -372,9 +418,15 @@ end
 -- bridge can tell it from a separator inside the text.
 local function RecordFor(id, rec)
 	local flags = Wire(rec.flags)
+	local inst = "i=" .. tostring(InstanceNum())
+	if flags == "" then
+		flags = inst
+	else
+		flags = flags .. ";" .. inst
+	end
 	local fields = { Wire(db.session), Wire(rec.chat), tostring(id), Wire(rec.cwd), flags, Wire(rec.name) }
 	if rec.ctx ~= nil then
-		fields[5] = flags == "" and "c" or (flags .. ";c")
+		fields[5] = flags .. ";c"
 		table.insert(fields, Wire(rec.ctx))
 	end
 	table.insert(fields, Wire(rec.text))
@@ -401,6 +453,14 @@ local function RefreshStrip()
 		size = size + #r + 1
 	end
 	ShowStrip(latest, table.concat(parts, RS))
+end
+
+-- UI scale / client size changed: re-fit the strip so the bridge keeps seeing ~4px cells.
+function WoWAI.OnDisplaySizeChanged()
+	if not strip then return end
+	run.stripScale, run.stripParentScale = nil, nil
+	ApplyStripScale(strip)
+	if run.stripShown then RefreshStrip() end
 end
 
 ---------------------------------------------------------------------------
@@ -431,12 +491,12 @@ end
 
 local function CheckSignal(kind, id)
 	if run.signalUnreliable then return false end
-	return SoundValid(string.format("Interface\\AddOns\\WoWAI\\%s\\%03d.wav", kind, SlotNumber(id)))
+	return SoundValid(string.format("%s\\%s\\%03d.wav", InstanceRoot(), kind, SlotNumber(id)))
 end
 
 -- Heartbeat: the bridge flips act/NNN/kk.wav for the k-th action of message NNN.
 local function ActPath(id, k)
-	return string.format("Interface\\AddOns\\WoWAI\\act\\%03d\\%02d.wav", SlotNumber(id), k)
+	return string.format("%s\\act\\%03d\\%02d.wav", InstanceRoot(), SlotNumber(id), k)
 end
 
 local function StartActivity(chat, id)
@@ -473,7 +533,7 @@ local function NotedBridge(at)
 end
 
 local function PresencePath(k)
-	return string.format("Interface\\AddOns\\WoWAI\\presence\\%04d.wav", k)
+	return string.format("%s\\presence\\%04d.wav", InstanceRoot(), k)
 end
 
 -- Valid presence files form a prefix 1..k, so a binary search finds the head.
@@ -587,14 +647,16 @@ function WoWAI.CheckConnection()
 	if run.connectingAt then
 		if WoWAI.IsConnected() then
 			run.connectingAt, run.connectFailed = nil, nil
-			-- A message typed while disconnected goes out now, without a second click,
-			-- as long as the same chat is still in front and free.
+			-- A message typed (or auto-whispered) while disconnected goes out now.
 			local queued = run.sendOnConnect
 			run.sendOnConnect = nil
-			local c = queued and ActiveChat()
-			if c and c.id == queued.chat and not c.pendingId then
-				if ui.input and Trim(ui.input:GetText() or "") == queued.text then ui.input:SetText("") end
-				WoWAI.Send(queued.text, queued.allow)
+			local c = queued and FindChat(queued.chat)
+			if c and not c.pendingId then
+				if not queued.silent and ui.input and ActiveChat() == c
+					and Trim(ui.input:GetText() or "") == queued.text then
+					ui.input:SetText("")
+				end
+				WoWAI.Send(queued.text, queued.allow, c)
 			end
 		elseif GetTime() - run.connectingAt > CONNECT_WAIT then
 			run.connectingAt, run.connectFailed = nil, true
@@ -667,7 +729,7 @@ end
 local function FreeSlot()
 	for i = 1, SLOT_COUNT do
 		local name = SlotName(i)
-		if not C_AddOns.IsAddOnLoaded(name) then
+		if not AddonLoaded(name) then
 			return name
 		end
 	end
@@ -701,20 +763,32 @@ local function MarkAcked(id)
 end
 
 -- Dispatch a list of reply records to the chats waiting for them.
+-- Ignore replies tagged for another multi-client instance.
 local function ApplyReplies(replies)
 	local matched = false
+	local mine = InstanceNum()
 	for _, r in ipairs(replies or {}) do
-		local c = FindChat(r.chat)
-		if c and c.pendingId and r.id == c.pendingId then
-			matched = true
-			MarkAcked(r.id)
-			local denied = type(r.denied) == "table" and #r.denied > 0 and r.denied or nil
-			if r.status == "done" then
-				Finish(c, "assistant", r.text or "", denied, r.agent, r.summary, WoWAI.CleanMacros(r.macros))
-			elseif r.status == "error" then
-				Finish(c, "system", "Bridge error: " .. tostring(r.text), denied)
-			elseif r.status == "working" then
-				c.progress = r.text
+		if r.instance ~= nil and tonumber(r.instance) ~= nil and tonumber(r.instance) ~= mine then
+			-- skip other instance
+		else
+			local c = FindChat(r.chat)
+			if c and c.pendingId and r.id == c.pendingId then
+				matched = true
+				MarkAcked(r.id)
+				local denied = type(r.denied) == "table" and #r.denied > 0 and r.denied or nil
+				if r.status == "done" then
+					if c.replyWhisper or c.replyParty then
+						c.pendingWhisperAction = r.whisperAction
+						c.pendingWhisperText = r.whisperText
+					end
+					Finish(c, "assistant", r.text or "", denied, r.agent, r.summary, WoWAI.CleanMacros(r.macros))
+				elseif r.status == "error" then
+					c.replyWhisper, c.replyParty = nil, nil
+					c.pendingWhisperAction, c.pendingWhisperText = nil, nil
+					Finish(c, "system", "Bridge error: " .. tostring(r.text), denied)
+				elseif r.status == "working" then
+					c.progress = r.text
+				end
 			end
 		end
 	end
@@ -772,7 +846,7 @@ local function TryLoadSlot(why)
 		return
 	end
 	WoWAI_SlotData = nil
-	local loaded, reason = C_AddOns.LoadAddOn(name)
+	local loaded, reason = LoadAddon(name)
 	if not loaded then
 		run.slotError = reason
 		if reason == "MISSING" or reason == "DISABLED" then
@@ -806,6 +880,13 @@ end
 local function Tick()
 	if not db then return end
 	local now = GetTime()
+	-- Window resize/maximize changes UIParent scale; keep strip cells physical-size stable.
+	if strip or run.stripShown then
+		local ps = (UIParent and UIParent.GetEffectiveScale and UIParent:GetEffectiveScale()) or 1
+		if run.stripParentScale ~= ps then
+			WoWAI.OnDisplaySizeChanged()
+		end
+	end
 	PollPresence()
 	-- Without presence beats, the only evidence is a slot read; spend one every
 	-- IDLE_POLL_SECONDS while idle so the light still reflects reality (and stays
@@ -922,7 +1003,37 @@ Finish = function(chat, role, text, denied, agent, summary, macros)
 		chat.draft = nil
 	end
 	WoWAI.Render()
+
+	local target = chat.replyWhisper
+	local wantParty = chat.replyParty
+	local action = chat.pendingWhisperAction
+	local wtext = chat.pendingWhisperText
+	chat.replyWhisper, chat.replyParty = nil, nil
+	chat.pendingWhisperAction, chat.pendingWhisperText = nil, nil
+	if target then
+		if role == "assistant" and action == "reply" and wtext and wtext ~= "" then
+			WoWAI.DeliverWhisper(target, wtext)
+			WoWAI.Notify(chat, '→ "' .. wtext .. '"', agent, wtext)
+			run.lastMessenger = "player"
+		end
+		WoWAI.DrainWhisperQueue()
+		WoWAI.DrainPartyQueue()
+		return
+	end
+	if wantParty then
+		if role == "assistant" and action == "reply" and wtext and wtext ~= "" then
+			WoWAI.DeliverParty(wtext)
+			WoWAI.Notify(chat, 'party → "' .. wtext .. '"', agent, wtext)
+			run.lastMessenger = "player"
+		end
+		WoWAI.DrainPartyQueue()
+		WoWAI.DrainWhisperQueue()
+		return
+	end
+
 	WoWAI.Notify(chat, text, agent, summary)
+	WoWAI.DrainWhisperQueue()
+	WoWAI.DrainPartyQueue()
 end
 
 ---------------------------------------------------------------------------
@@ -998,7 +1109,7 @@ function WoWAI.GameContext()
 	local lines = {}
 	local version, build, _, toc = Try(GetBuildInfo)
 	toc = tonumber(toc)
-	local game = "World of Warcraft"
+	local game = "World of Warcraft 3.3.5a (WotLK)"
 	if toc and toc >= 16000 and toc < 20000 then game = "World of Warcraft: Forever" end
 	local client = ""
 	if version then
@@ -1031,17 +1142,19 @@ function WoWAI.GameContext()
 		table.insert(lines, "Location: " .. zone .. ((sub and sub ~= "" and sub ~= zone) and (" - " .. sub) or ""))
 	end
 
-	-- Map coordinates, as the minimap shows them (0-100 across the current map;
-	-- addons get no world x/y/z). Modern C_Map first, the vanilla call as fallback.
-	local x, y, mapName
-	local mapId = Try(C_Map and C_Map.GetBestMapForUnit, "player")
-	if type(mapId) == "number" then
-		local pos = Try(C_Map.GetPlayerMapPosition, mapId, "player")
-		if type(pos) == "table" and type(pos.x) == "number" and type(pos.y) == "number" then x, y = pos.x, pos.y end
-		local info = Try(C_Map.GetMapInfo, mapId)
-		if type(info) == "table" and type(info.name) == "string" then mapName = info.name end
+	-- Map coordinates (0-100). Prefer classic GetPlayerMapPosition on 3.3.5a.
+	local x, y, mapName, mapId
+	if C_Map and C_Map.GetBestMapForUnit then
+		mapId = Try(C_Map.GetBestMapForUnit, "player")
+		if type(mapId) == "number" then
+			local pos = Try(C_Map.GetPlayerMapPosition, mapId, "player")
+			if type(pos) == "table" and type(pos.x) == "number" and type(pos.y) == "number" then x, y = pos.x, pos.y end
+			local info = Try(C_Map.GetMapInfo, mapId)
+			if type(info) == "table" and type(info.name) == "string" then mapName = info.name end
+		end
 	end
-	if not x then
+	if not x and GetPlayerMapPosition then
+		Try(SetMapToCurrentZone)
 		local px, py = Try(GetPlayerMapPosition, "player")
 		if type(px) == "number" and type(py) == "number" then x, y = px, py end
 	end
@@ -1114,9 +1227,13 @@ end
 -- The context to put on the next record, or nil when the bridge already has
 -- it (or it wouldn't fit next to this message; it goes with a later one).
 -- "" when the setting is off, so the bridge drops what it had.
-local function ContextToSend(room)
+-- Assist sends (not auto-whisper/party coaches) always include a fresh snapshot
+-- so questions like "where am I?" still work after a bridge restart.
+local function ContextToSend(room, autoCoach)
 	local ctx = db.settings.context and WoWAI.GameContext() or ""
-	if ctx == (run.contextSent or "") then return nil end
+	if autoCoach then
+		if ctx == (run.contextSent or "") then return nil end
+	end
 	if room and #ctx > room then return nil end
 	return ctx
 end
@@ -1189,12 +1306,17 @@ end
 ---------------------------------------------------------------------------
 
 -- allow: optional list of permission rules to grant before this message runs.
-function WoWAI.Send(text, allow)
-	local c = ActiveChat()
+-- targetChat: optional chat to send on (auto-whisper uses this so the active
+-- chat and input box are left alone).
+function WoWAI.Send(text, allow, targetChat)
+	local c = targetChat or ActiveChat()
 	if not c then return end
+	local silent = targetChat ~= nil and targetChat ~= ActiveChat()
 	text = Trim(text or "")
 	if c.pendingId then
 		-- Typing while waiting: keep the draft, and check for the reply.
+		-- Silent/auto-whisper callers queue instead of writing the draft.
+		if silent then return end
 		if text ~= "" then c.draft = text end
 		if db.settings.mode == "pixel" and not (run.slotsExhausted or run.slotsMissing) then
 			TryLoadSlot("manual")
@@ -1205,13 +1327,12 @@ function WoWAI.Send(text, allow)
 	end
 	if text == "" then return end
 	if not WoWAI.IsConnected() then
-		-- Not connected: the message stays in the box and we try to connect;
-		-- CheckConnection sends it the moment the light turns green. If the bridge
-		-- never answers, the text is still in the box for a later try.
-		if ui.input then ui.input:SetText(text) end
-		run.sendOnConnect = { chat = c.id, text = text, allow = allow }
+		-- Not connected: try to connect; CheckConnection sends when the light
+		-- turns green. Manual sends keep the text in the box; silent ones don't.
+		if not silent and ui.input then ui.input:SetText(text) end
+		run.sendOnConnect = { chat = c.id, text = text, allow = allow, silent = silent }
 		if not run.connectingAt then WoWAI.Connect() end
-		WoWAI.Toggle(true)
+		if not silent then WoWAI.Toggle(true) end
 		return
 	end
 	-- Shift-clicked links become [Name] plus their tooltip, which is what the agent can read.
@@ -1223,14 +1344,23 @@ function WoWAI.Send(text, allow)
 		WoWAI.Render()
 		return
 	end
-	-- The game context rides along when the bridge doesn't have this version yet.
-	local ctx = ContextToSend(limit - #text)
+	-- Persona coaches only for auto-whisper / auto-party (those set replyWhisper /
+	-- replyParty before Send). Typing in the addon is always assist — even on a
+	-- W:/Party tab — so "where am I?" never hits the dismissive whisper voice.
+	local autoCoach = (c.replyWhisper ~= nil) or (c.replyParty ~= nil)
+
+	-- Assist always sends a fresh snapshot (see ContextToSend).
+	local ctx = ContextToSend(limit - #text, autoCoach)
 
 	db.lastSeq = db.lastSeq + 1
 	local id = db.lastSeq
 	local tokens = {}
 	if c.resetNext then table.insert(tokens, "n") end
 	if c.agent and c.agent ~= "" then table.insert(tokens, "agent=" .. c.agent) end
+	-- Auto-whisper: bridge returns JSON reply|skip (flag "w").
+	if c.replyWhisper then table.insert(tokens, "w") end
+	-- Auto-party: flag "p".
+	if c.replyParty then table.insert(tokens, "p") end
 	local allowHex
 	if type(allow) == "table" and #allow > 0 then
 		table.insert(tokens, "allow=" .. table.concat(allow, ","))
@@ -1248,6 +1378,7 @@ function WoWAI.Send(text, allow)
 		ctx = ctx and ToHex(ctx) or nil,
 		agent = (c.agent and c.agent ~= "") and c.agent or nil,
 		allow = allowHex,
+		instance = InstanceNum(),
 		newSession = newSession,
 		t = time(),
 	}
@@ -1264,7 +1395,7 @@ function WoWAI.Send(text, allow)
 		end
 		if first then c.name = AutoTitle(text) or c.name end
 	end
-	db.settings.shown = true
+	if not silent then db.settings.shown = true end
 
 	if db.settings.mode == "pixel" then
 		run.outbound[id] = { chat = c.id, cwd = c.cwd, flags = flags, name = c.name, text = text, ctx = ctx, sentAt = GetTime() }
@@ -1277,6 +1408,178 @@ function WoWAI.Send(text, allow)
 	else
 		SafeReload()
 	end
+end
+
+---------------------------------------------------------------------------
+-- Whisper auto-reply (opt-in via settings.autoWhisper)
+-- Incoming whispers go to the bridge; the model returns JSON {action,text}.
+-- Bridge parses it; the addon whispers back only when action is "reply".
+---------------------------------------------------------------------------
+
+local WHISPER_QUEUE_MAX = 8
+
+local function PlayerName()
+	return Try(UnitName, "player") or ""
+end
+
+local function SamePlayer(sender)
+	if not sender or sender == "" then return true end
+	local me = PlayerName()
+	if me == "" then return false end
+	if sender == me then return true end
+	local bare = sender:match("^([^%-]+)")
+	return bare == me
+end
+
+local function FindWhisperChat(sender)
+	for _, c in ipairs(db.chats) do
+		if c.whisperFrom == sender then return c end
+	end
+	local label = "W: " .. sender
+	for _, c in ipairs(db.chats) do
+		if c.name == label then
+			c.whisperFrom = sender
+			return c
+		end
+	end
+end
+
+local function EnsureWhisperChat(sender)
+	local c = FindWhisperChat(sender)
+	if c then return c end
+	c = AddChat("W: " .. sender)
+	if c then c.whisperFrom = sender end
+	return c
+end
+
+function WoWAI.DeliverWhisper(target, body)
+	if not target or not target.name then return end
+	body = Trim(body or "")
+	if body == "" then return end
+	if #body > 250 then body = body:sub(1, 247) .. "..." end
+	if target.bn and type(BNSendWhisper) == "function" then
+		local ok = pcall(BNSendWhisper, target.bn, body)
+		if ok then return end
+	end
+	if type(SendChatMessage) == "function" then
+		pcall(SendChatMessage, body, "WHISPER", nil, target.name)
+	end
+end
+
+local function DrainWhisperQueue()
+	local q = run.whisperQueue
+	if not q or #q == 0 then return end
+	local next = table.remove(q, 1)
+	if next then WoWAI.HandleAutoWhisper(next.sender, next.text, next.bn) end
+end
+WoWAI.DrainWhisperQueue = DrainWhisperQueue
+
+function WoWAI.HandleAutoWhisper(sender, text, bn)
+	if not db or not db.settings.autoWhisper then return end
+	text = Trim(text or "")
+	if text == "" or SamePlayer(sender) then return end
+	local c = EnsureWhisperChat(sender)
+	if not c then return end
+	if bn then c.whisperBn = bn end
+
+	-- One decision at a time per chat (and globally via pending).
+	if c.pendingId or (run.sendOnConnect and run.sendOnConnect.chat == c.id) then
+		run.whisperQueue = run.whisperQueue or {}
+		if #run.whisperQueue < WHISPER_QUEUE_MAX then
+			table.insert(run.whisperQueue, { sender = sender, text = text, bn = bn })
+		end
+		return
+	end
+
+	c.replyWhisper = { name = sender, bn = bn or c.whisperBn }
+	-- Silent send: do not steal the active chat or input box.
+	WoWAI.Send(text, nil, c)
+	local visible = ui.frame and ui.frame:IsShown() and db.activeChat == c.id
+	if not visible then
+		c.unread = (c.unread or 0) + 1
+		WoWAI.UpdateMini()
+	end
+	WoWAI.RenderChatList()
+end
+
+function WoWAI.OnIncomingWhisper(sender, text, bn)
+	run.lastMessenger = "player"
+	if not db or not db.settings.autoWhisper then return end
+	WoWAI.HandleAutoWhisper(sender, text, bn)
+end
+
+---------------------------------------------------------------------------
+-- Party auto-reply (opt-in via settings.autoParty)
+-- Only CHAT_MSG_PARTY / PARTY_LEADER — never raid or battleground chat.
+-- Bridge returns JSON {action,text}; addon sends to PARTY on reply.
+---------------------------------------------------------------------------
+
+local PARTY_QUEUE_MAX = 8
+
+local function EnsurePartyChat()
+	for _, c in ipairs(db.chats) do
+		if c.partyChat then return c end
+	end
+	for _, c in ipairs(db.chats) do
+		if c.name == "Party" then
+			c.partyChat = true
+			return c
+		end
+	end
+	local c = AddChat("Party")
+	if c then c.partyChat = true end
+	return c
+end
+
+function WoWAI.DeliverParty(body)
+	body = Trim(body or "")
+	if body == "" then return end
+	if #body > 250 then body = body:sub(1, 247) .. "..." end
+	if type(SendChatMessage) == "function" then
+		pcall(SendChatMessage, body, "PARTY")
+	end
+end
+
+local function DrainPartyQueue()
+	local q = run.partyQueue
+	if not q or #q == 0 then return end
+	local next = table.remove(q, 1)
+	if next then WoWAI.HandleAutoParty(next.sender, next.text) end
+end
+WoWAI.DrainPartyQueue = DrainPartyQueue
+
+function WoWAI.HandleAutoParty(sender, text)
+	if not db or not db.settings.autoParty then return end
+	text = Trim(text or "")
+	if text == "" or SamePlayer(sender) then return end
+	local c = EnsurePartyChat()
+	if not c then return end
+
+	local bare = sender and sender:match("^([^%-]+)") or sender or "?"
+	local line = bare .. ": " .. text
+
+	if c.pendingId or (run.sendOnConnect and run.sendOnConnect.chat == c.id) then
+		run.partyQueue = run.partyQueue or {}
+		if #run.partyQueue < PARTY_QUEUE_MAX then
+			table.insert(run.partyQueue, { sender = sender, text = text })
+		end
+		return
+	end
+
+	c.replyParty = true
+	WoWAI.Send(line, nil, c)
+	local visible = ui.frame and ui.frame:IsShown() and db.activeChat == c.id
+	if not visible then
+		c.unread = (c.unread or 0) + 1
+		WoWAI.UpdateMini()
+	end
+	WoWAI.RenderChatList()
+end
+
+function WoWAI.OnIncomingParty(sender, text)
+	run.lastMessenger = "player"
+	if not db or not db.settings.autoParty then return end
+	WoWAI.HandleAutoParty(sender, text)
 end
 
 -- Forget: a record with no text telling the bridge a chat was deleted, so it drops
@@ -1908,8 +2211,8 @@ function WoWAI.Render()
 			local b = GetBubble(n)
 			local st = ROLE_STYLE[role] or ROLE_STYLE.system
 			b:SetWidth(width)
-			b.bg:SetColorTexture(st.bg[1], st.bg[2], st.bg[3], st.bg[4])
-			b.accent:SetColorTexture(st.color[1], st.color[2], st.color[3], 0.9)
+			WoWAI_Compat.SetSolidColor(b.bg, st.bg[1], st.bg[2], st.bg[3], st.bg[4])
+			WoWAI_Compat.SetSolidColor(b.accent, st.color[1], st.color[2], st.color[3], 0.9)
 			b.who:SetText(st == ROLE_STYLE.assistant and ReplyAgentName(c, agent) or st.label)
 			b.who:SetTextColor(st.color[1], st.color[2], st.color[3])
 			b.when:SetText(when or "")
@@ -2005,7 +2308,7 @@ end
 -- Copy box (/wow-ai copy): a selectable EditBox with the last reply pre-highlighted for Ctrl+C.
 function WoWAI.ShowCopy(text)
 	if not ui.copy then
-		local cf = CreateFrame("Frame", "WoWAICopy", UIParent, "BackdropTemplate")
+		local cf = CreateFrame("Frame", "WoWAICopy", UIParent)
 		cf:SetSize(560, 320)
 		cf:SetPoint("CENTER")
 		cf:SetFrameStrata("FULLSCREEN_DIALOG")
@@ -2034,7 +2337,7 @@ function WoWAI.ShowCopy(text)
 		eb:SetMultiLine(true)
 		eb:SetAutoFocus(false)
 		eb:SetFontObject(ChatFontNormal)
-		eb:SetMaxLetters(0)
+		eb:SetMaxLetters(10000)
 		eb:SetSize(500, 260)
 		eb:SetScript("OnEscapePressed", function() cf:Hide() end)
 		sc:SetScrollChild(eb)
@@ -2270,13 +2573,22 @@ local function HookReplyCommand()
 end
 
 -- Clicks on our [reply] / [open] links in the chat frame.
-hooksecurefunc("SetItemRef", function(link)
-	local action, chatId = tostring(link):match("^wowai:(%a+):(%w+)")
-	if not action or not db then return end
-	if FindChat(chatId) then WoWAI.SwitchChat(chatId) end
-	WoWAI.Toggle(true)
-	if action == "reply" and ui.input then ui.input:SetFocus() end
-end)
+-- Must wrap SetItemRef *before* Blizzard runs: hooksecurefunc is too late —
+-- ItemRefTooltip:SetHyperlink("wowai:…") errors with "Unknown link type"
+-- (often surfaces under DBM's SetHyperlink wrapper).
+do
+	local orig = SetItemRef
+	function SetItemRef(link, text, button, ...)
+		local action, chatId = tostring(link or ""):match("^wowai:(%a+):(%w+)")
+		if action and db then
+			if FindChat(chatId) then WoWAI.SwitchChat(chatId) end
+			WoWAI.Toggle(true)
+			if action == "reply" and ui.input then ui.input:SetFocus() end
+			return
+		end
+		if orig then return orig(link, text, button, ...) end
+	end
+end
 
 -- Shift-clicking an item, spell, quest or name puts its link into the chat box
 -- being typed in. Blizzard's insert function only knows its own boxes, so when
@@ -2309,13 +2621,36 @@ local function MakeButton(parent, label, width, onClick)
 	return b
 end
 
+local function MakeCheck(parent, label, checked, tip, onChange)
+	local cb = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
+	cb:SetSize(24, 24)
+	if cb.SetChecked then cb:SetChecked(checked and true or false) end
+	local text = cb:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	text:SetPoint("LEFT", cb, "RIGHT", 0, 0)
+	text:SetText(label)
+	cb.label = text
+	cb:SetScript("OnClick", function(self)
+		local on = self:GetChecked() and true or false
+		onChange(on)
+	end)
+	if tip then
+		cb:SetScript("OnEnter", function(self)
+			GameTooltip:SetOwner(self, "ANCHOR_TOP")
+			GameTooltip:SetText(tip, nil, nil, nil, nil, true)
+			GameTooltip:Show()
+		end)
+		cb:SetScript("OnLeave", function() GameTooltip:Hide() end)
+	end
+	return cb
+end
+
 local PANEL_W = 150
 
 local function BuildUI()
 	if ui.frame then return end
 	local s = db.settings
 
-	local f = CreateFrame("Frame", "WoWAIFrame", UIParent, "BackdropTemplate")
+	local f = CreateFrame("Frame", "WoWAIFrame", UIParent)
 	ui.frame = f
 	f:SetSize(s.width, s.height)
 	if s.point then
@@ -2327,7 +2662,7 @@ local function BuildUI()
 	f:SetMovable(true)
 	f:SetResizable(true)
 	f:SetClampedToScreen(true)
-	f:SetResizeBounds(560, 300)
+	WoWAI_Compat.SetMinResize(f, 560, 300)
 	f:EnableMouse(true)
 	f:RegisterForDrag("LeftButton")
 	f:SetScript("OnDragStart", f.StartMoving)
@@ -2390,10 +2725,10 @@ local function BuildUI()
 		local dash = mini:CreateTexture(nil, "ARTWORK")
 		dash:SetSize(10, 2)
 		dash:SetPoint("CENTER", mini, "CENTER", 0, -3)
-		dash:SetColorTexture(0.9, 0.9, 0.9, 1)
+		WoWAI_Compat.SetSolidColor(dash, 0.9, 0.9, 0.9, 1)
 		local hl = mini:CreateTexture(nil, "HIGHLIGHT")
 		hl:SetAllPoints()
-		hl:SetColorTexture(1, 1, 1, 0.15)
+		WoWAI_Compat.SetSolidColor(hl, 1, 1, 1, 0.15)
 	end
 	mini:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -4)
 	mini:SetScript("OnClick", function() WoWAI.Minimize(true) end)
@@ -2419,7 +2754,7 @@ local function BuildUI()
 	end)
 
 	-- Left panel: chat list
-	local panel = CreateFrame("Frame", nil, f, "BackdropTemplate")
+	local panel = CreateFrame("Frame", nil, f)
 	panel:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -52)
 	panel:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 14, 50)
 	panel:SetWidth(PANEL_W)
@@ -2438,7 +2773,7 @@ local function BuildUI()
 	-- Per-chat menu: Rename, Folder and Agent, opened by right-clicking a chat
 	-- row. A plain frame of our own rather than a Blizzard dropdown, so it looks
 	-- the same on every client.
-	local menu = CreateFrame("Frame", "WoWAIChatMenu", f, "BackdropTemplate")
+	local menu = CreateFrame("Frame", "WoWAIChatMenu", f)
 	menu:SetSize(110, 4 * 20 + 12)
 	menu:SetFrameStrata("TOOLTIP")
 	menu:SetBackdrop({
@@ -2461,7 +2796,7 @@ local function BuildUI()
 		it:SetPoint("TOPLEFT", menu, "TOPLEFT", 6, -6 - order * 20)
 		local hl = it:CreateTexture(nil, "HIGHLIGHT")
 		hl:SetAllPoints()
-		hl:SetColorTexture(1, 1, 1, 0.12)
+		WoWAI_Compat.SetSolidColor(hl, 1, 1, 1, 0.12)
 		it.label = it:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 		it.label:SetPoint("LEFT", it, "LEFT", 6, 0)
 		it.label:SetText(label)
@@ -2510,11 +2845,11 @@ local function BuildUI()
 		b:SetPoint("TOP", newBtn, "BOTTOM", 0, -6 - (i - 1) * 21)
 		b.selected = b:CreateTexture(nil, "BACKGROUND")
 		b.selected:SetAllPoints()
-		b.selected:SetColorTexture(1, 1, 1, 0.12)
+		WoWAI_Compat.SetSolidColor(b.selected, 1, 1, 1, 0.12)
 		b.selected:Hide()
 		local hl = b:CreateTexture(nil, "HIGHLIGHT")
 		hl:SetAllPoints()
-		hl:SetColorTexture(1, 1, 1, 0.08)
+		WoWAI_Compat.SetSolidColor(hl, 1, 1, 1, 0.08)
 
 		-- Trash can: delete this chat (asks first). Blizzard's red delete button
 		-- where the client has it, a plain X elsewhere.
@@ -2582,7 +2917,7 @@ local function BuildUI()
 
 	-- Input box, with Send docked at its right end like a messaging app.
 	local SEND_W = 84
-	local inputBg = CreateFrame("Frame", nil, f, "BackdropTemplate")
+	local inputBg = CreateFrame("Frame", nil, f)
 	inputBg:SetPoint("BOTTOMLEFT", panel, "BOTTOMRIGHT", 8, 0)
 	inputBg:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -14 - SEND_W - 6, 50)
 	inputBg:SetHeight(54)
@@ -2603,15 +2938,23 @@ local function BuildUI()
 	input:SetMultiLine(true)
 	input:SetAutoFocus(false)
 	input:SetFontObject(ChatFontNormal)
-	input:SetMaxLetters(0)
+	-- 0 = "unlimited" on retail; on 3.3.5a it can misbehave — use a large cap.
+	input:SetMaxLetters(10000)
 	input:SetSize(500, 40)
 	input:SetScript("OnEnterPressed", function() WoWAI.SendFromInput() end)
 	input:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+	-- If focus is ever stolen on show, give the keyboard back immediately.
+	input:SetScript("OnEditFocusGained", function(self)
+		if not ui.frame or not ui.frame:IsShown() then
+			self:ClearFocus()
+		end
+	end)
 	inScroll:SetScrollChild(input)
 	inScroll:HookScript("OnSizeChanged", function(self, w, h)
 		input:SetWidth(w)
 	end)
 	inputBg:SetScript("OnMouseDown", function() input:SetFocus() end)
+	input:ClearFocus()
 	ui.input = input
 
 	-- Send sits to the right of the input box, vertically centred on it.
@@ -2655,6 +2998,22 @@ local function BuildUI()
 	resend:Hide()
 	ui.resend = resend
 
+	local autoWhisper = MakeCheck(f, "Auto-whisper", s.autoWhisper,
+		"AI decides reply or skip on incoming whispers, then whispers for you when it replies. Botty lines are skipped.",
+		function(on)
+			s.autoWhisper = on
+		end)
+	autoWhisper:SetPoint("LEFT", clear, "RIGHT", 86, 0)
+	ui.autoWhisper = autoWhisper
+
+	local autoParty = MakeCheck(f, "Auto-party", s.autoParty,
+		"AI decides reply or skip on party chat only (not raid/BG), then speaks in /p when it replies.",
+		function(on)
+			s.autoParty = on
+		end)
+	autoParty:SetPoint("LEFT", autoWhisper, "RIGHT", 100, 0)
+	ui.autoParty = autoParty
+
 	-- A named, always-present button so a keybinding can click it (see /wow-ai bind).
 	local hotkey = CreateFrame("Button", "WoWAIRefreshButton", UIParent)
 	hotkey:SetSize(1, 1)
@@ -2689,7 +3048,7 @@ local function BuildUI()
 	end)
 
 	-- Mini bar: what the window collapses into. Click it to expand, drag to move.
-	local m = CreateFrame("Frame", "WoWAIMini", UIParent, "BackdropTemplate")
+	local m = CreateFrame("Frame", "WoWAIMini", UIParent)
 	ui.mini = m
 	m:SetSize(250, 30)
 	if s.miniPoint then
@@ -2782,8 +3141,10 @@ function WoWAI.Toggle(show)
 	if show then
 		WoWAI.Render()
 		-- No auto-focus: the game keeps the keyboard until you click the box.
-		-- No automatic hello either: if the bridge hasn't been seen, the panel
-		-- shows Connect in place of Send and waits for a click.
+		-- Clear anyway — 3.3.5a sometimes focuses multiline EditBoxes on Show.
+		if ui.input then ui.input:ClearFocus() end
+	else
+		if ui.input then ui.input:ClearFocus() end
 	end
 	WoWAI.UpdateMini()
 end
@@ -2823,6 +3184,7 @@ local HELP = table.concat({
 	"/wow-ai reset                  next message in this chat starts a fresh agent session",
 	"/wow-ai context [on|off]       what the agent is told about your character and where you are (no argument = show it)",
 	"/wow-ai map [...]              map layers the agent drew, the route navigator and herb/ore nodes (no argument = status and subcommands; /aimap is the same)",
+	"/wow-ai instance [1-8]         multi-client: which instance this window is (must match bridge left→right order)",
 	"/wow-ai mode pixel             no-reload transport (default)",
 	"/wow-ai mode reload            fallback transport: a /reload per step",
 	"/wow-ai resend                 show the strip again if the bridge missed it",
@@ -2832,6 +3194,8 @@ local HELP = table.concat({
 	"/wow-ai macro undo             undo the last macro the agent's button created or changed",
 	"/wow-ai bind <key>             hotkey: checks for a reply while waiting, else toggles the window",
 	"/wow-ai auto on|off            reload-mode only: auto-reload on your next keypress after the interval",
+	"/wow-ai autowhisper on|off     AI decides reply/skip and may whisper for you (also a checkbox)",
+	"/wow-ai autoparty on|off       AI decides reply/skip in party chat only (also a checkbox)",
 	"/wow-ai signal on|off          the cheap sound-file readiness check (off if it spams errors)",
 	"/wow-ai slots                  how many reply slots are still free this session",
 	"/wow-ai diag                   transport diagnostics (is the cheap sound-file channel working?)",
@@ -2860,11 +3224,14 @@ local COMMAND_ARGS = {
 	context = { [""] = true, on = true, off = true }, ctx = { [""] = true, on = true, off = true },
 	mode = { [""] = true, pixel = true, reload = true },
 	signal = { [""] = true, on = true, off = true }, longchat = { [""] = true, on = true, off = true },
+	autowhisper = { [""] = true, on = true, off = true },
+	autoparty = { [""] = true, on = true, off = true },
 	auto = OnOffOrNumber,
 	echo = function(rest) return rest == "" or rest == "summary" or rest == "full" or rest == "short" or rest == "off" or tonumber(rest) ~= nil end,
 	bind = 1, agent = 1,
 	chat = ChatArgument, chats = ChatArgument,
 	cd = true, new = true, rename = true,
+	instance = 1, inst = 1,
 	map = true, -- /wow-ai map ...: Map.lua (layers, navigator, herb/ore nodes)
 	macro = { undo = true }, -- /wow-ai macro undo; "/ai macro for my warrior" still goes to the agent
 }
@@ -2941,6 +3308,16 @@ SlashCmdList["WOWAI"] = function(msg)
 	elseif cmd == "cd" then
 		WoWAI.SetFolder(rest, c)
 		WoWAI.Toggle(true)
+	elseif cmd == "instance" or cmd == "inst" then
+		local n = tonumber(rest)
+		if n and n >= 1 and n <= 8 then
+			s.instance = math.floor(n)
+			AddHistory(c, "system", "Client instance set to " .. s.instance .. ". The bridge assigns windows left→right as 1, 2, … Match that order. Re-run Install slots in the Go bridge, then fully restart WoW after changing instance.")
+		else
+			AddHistory(c, "system", "This client is instance " .. InstanceNum() .. ". Set with /wow-ai instance <1-8>. Window order is left→right on screen.")
+		end
+		WoWAI.Render()
+		WoWAI.Toggle(true)
 	elseif cmd == "map" then
 		if WoWAIMap then WoWAIMap.Command(rest) else print("|cff66ccff[WoW AI]|r the map module did not load") end
 	elseif cmd == "agent" then
@@ -2991,6 +3368,26 @@ SlashCmdList["WOWAI"] = function(msg)
 		end
 		WoWAI.UpdateStatus()
 		WoWAI.ArmAutoRefresh()
+	elseif cmd == "autowhisper" then
+		if rest == "on" then s.autoWhisper = true
+		elseif rest == "off" then s.autoWhisper = false
+		end
+		if ui.autoWhisper and ui.autoWhisper.SetChecked then
+			ui.autoWhisper:SetChecked(s.autoWhisper and true or false)
+		end
+		AddHistory(c, "system", "auto-whisper is " .. (s.autoWhisper and "ON" or "OFF")
+			.. (s.autoWhisper and ": incoming whispers go to the AI; it replies or stays silent (botty lines are skipped)" or ""))
+		WoWAI.Render()
+	elseif cmd == "autoparty" then
+		if rest == "on" then s.autoParty = true
+		elseif rest == "off" then s.autoParty = false
+		end
+		if ui.autoParty and ui.autoParty.SetChecked then
+			ui.autoParty:SetChecked(s.autoParty and true or false)
+		end
+		AddHistory(c, "system", "auto-party is " .. (s.autoParty and "ON" or "OFF")
+			.. (s.autoParty and ": party chat goes to the AI (not raid/BG); it may speak in /p" or ""))
+		WoWAI.Render()
 	elseif cmd == "hide" or cmd == "quit" then
 		WoWAI.Toggle(false)
 	elseif cmd == "macro" and rest == "undo" then
@@ -3022,7 +3419,7 @@ SlashCmdList["WOWAI"] = function(msg)
 	elseif cmd == "slots" then
 		local free = 0
 		for i = 1, SLOT_COUNT do
-			if not C_AddOns.IsAddOnLoaded(SlotName(i)) then free = free + 1 end
+			if not AddonLoaded(SlotName(i)) then free = free + 1 end
 		end
 		AddHistory(c, "system", free .. " of " .. SLOT_COUNT .. " reply slots free this session (a reload frees all)")
 		WoWAI.Render()
@@ -3041,7 +3438,7 @@ SlashCmdList["WOWAI"] = function(msg)
 	elseif cmd == "diag" then
 		local free = 0
 		for i = 1, SLOT_COUNT do
-			if not C_AddOns.IsAddOnLoaded(SlotName(i)) then free = free + 1 end
+			if not AddonLoaded(SlotName(i)) then free = free + 1 end
 		end
 		local lines = {
 			"sound channel: " .. (signalAvailable and "usable" or "UNUSABLE") .. " (self-test: " .. tostring(signalStats.selftest) .. ")" .. (signalStats.error and (" error: " .. signalStats.error) or ""),
@@ -3093,14 +3490,28 @@ ev:RegisterEvent("PLAYER_REGEN_ENABLED")
 ev:RegisterEvent("UPDATE_MACROS")
 ev:RegisterEvent("CHAT_MSG_WHISPER")
 ev:RegisterEvent("CHAT_MSG_BN_WHISPER")
-ev:SetScript("OnEvent", function(self, event, arg1)
+ev:RegisterEvent("CHAT_MSG_PARTY")
+ev:RegisterEvent("CHAT_MSG_PARTY_LEADER")
+ev:RegisterEvent("DISPLAY_SIZE_CHANGED")
+ev:SetScript("OnEvent", function(self, event, ...)
 	if event == "ADDON_LOADED" then
+		local arg1 = ...
 		if arg1 == ADDON_NAME then
 			InitDB()
 		end
-	elseif event == "CHAT_MSG_WHISPER" or event == "CHAT_MSG_BN_WHISPER" then
-		-- A real person whispered: /r belongs to them again.
-		run.lastMessenger = "player"
+	elseif event == "DISPLAY_SIZE_CHANGED" then
+		WoWAI.OnDisplaySizeChanged()
+	elseif event == "CHAT_MSG_WHISPER" then
+		local msg, sender = ...
+		WoWAI.OnIncomingWhisper(sender, msg, nil)
+	elseif event == "CHAT_MSG_BN_WHISPER" then
+		local msg, sender = ...
+		local bn = select(13, ...)
+		if type(bn) ~= "number" then bn = nil end
+		WoWAI.OnIncomingWhisper(sender, msg, bn)
+	elseif event == "CHAT_MSG_PARTY" or event == "CHAT_MSG_PARTY_LEADER" then
+		local msg, sender = ...
+		WoWAI.OnIncomingParty(sender, msg)
 	elseif event == "PLAYER_LOGIN" then
 		if not db then InitDB() end
 		BuildUI()
@@ -3133,6 +3544,18 @@ ev:SetScript("OnEvent", function(self, event, arg1)
 				WoWAI.Toggle(true)
 			end
 		end
+		-- Hard guarantee: never leave our EditBox holding WASD after login.
+		if ui.input then ui.input:ClearFocus() end
+		if ui.copyBox then ui.copyBox:ClearFocus() end
+		keyCatcher:Hide()
+		keyCatcher:EnableKeyboard(false)
+		-- One frame later: multiline EditBoxes on 3.3.5a can re-take focus after Show.
+		C_Timer.After(0, function()
+			if ui.input then ui.input:ClearFocus() end
+			if ui.copyBox then ui.copyBox:ClearFocus() end
+			keyCatcher:Hide()
+			keyCatcher:EnableKeyboard(false)
+		end)
 		WoWAI.ArmAutoRefresh()
 		WoWAI.UpdateDot()
 		if db.settings.longchat then ApplyLongChat() end

@@ -1,11 +1,11 @@
-## Interface: 16001
+## Interface: 30300
 ## Title: WoW AI
-## Notes: Talk to Claude Code, Codex, Grok, Antigravity or Hermes from inside the game, one session per chat; ready-made macros and map routes from the agent. Needs the companion bridge (see README).
+## Notes: Talk to a local coding agent / LLM bridge from inside WoW 3.3.5a. Needs the companion bridge (see go-bridge/).
 ## Author: chelinho139
-## Version: 0.4.0
+## Version: 0.4.0-335a
 ## SavedVariables: WoWAIDB, WoWAIMapDB
-## OptionalDeps: WoWAI_Nodes
 
+Compat.lua
 Codec.lua
 Inbox.lua
 WoWAI.lua

@@ -16,3 +16,10 @@ tests/tmp/
 bridge/probe.png
 bridge/mapjobs/
 __pycache__/
+wow-path.local.sh
+go-bridge/wow-ai-bridge.exe
+go-bridge/go-whisper-client
+go-bridge/go-party-client
+*.exe
+*~
+copy-to-game.sh

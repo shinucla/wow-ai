@@ -110,6 +110,10 @@ wow-ai
 
 Every chat that hasn't picked its own folder now works in `realms`, and the panel's cwd line shows it. `wow-ai --project <dir>` names the folder explicitly; `npm start` inside this repo falls back to `defaultCwd` in the config. Only one bridge can run at a time (two would fight over the screen and the slot files), so this sets the default folder rather than giving you one bridge per project.
 
+### Go UI bridge (Windows, LLM API)
+
+An alternate Windows bridge lives in [`go-bridge/`](go-bridge/): same pixel-strip / slot-file protocol, a local Status + Settings UI (API key, model, AddOns path), and direct OpenAI / Anthropic / OpenAI-compatible HTTP calls instead of the Claude/Codex CLIs. Build with `go build -o wow-ai-bridge.exe ./cmd/wow-ai-bridge` inside `go-bridge`. Details in [go-bridge/README.md](go-bridge/README.md).
+
 ## Use
 
 In game: `/wow-ai` opens the window. Until the bridge has answered, a **Connect** button sits where Send would be: start the bridge, click it, and the light turns green (a message typed before that stays in the box). Then click the input box, type, Enter. The reply arrives with the whisper sound; the window's light shows the bridge state (green/yellow/red, hover for details), and **Reconnect** shows up if the bridge goes quiet.

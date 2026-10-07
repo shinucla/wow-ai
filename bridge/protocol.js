@@ -113,14 +113,17 @@ function sameFolder(a, b) {
 // session (no prompt), "allow=Rule1,Rule2" = add these permission rules before
 // running, "c" = the record carries a game-context field before the text (an
 // empty one clears the context the bridge keeps), "agent=codex" = run this
-// chat with that agent instead of the bridge's default (see agents.js).
+// chat with that agent instead of the bridge's default (see agents.js),
+// "w" = auto-whisper decision; "p" = auto-party decision.
 function parseFlags(flags) {
-  const out = { newSession: false, hello: false, forget: false, context: false, allow: [], agent: '' };
+  const out = { newSession: false, hello: false, forget: false, context: false, whisperHelp: false, partyHelp: false, allow: [], agent: '' };
   for (const tok of String(flags || '').split(';')) {
     if (tok === 'n') out.newSession = true;
     else if (tok === 'h') out.hello = true;
     else if (tok === 'd') out.forget = true;
     else if (tok === 'c') out.context = true;
+    else if (tok === 'w') out.whisperHelp = true;
+    else if (tok === 'p') out.partyHelp = true;
     else if (tok.startsWith('allow=')) out.allow.push(...tok.slice(6).split(',').map(s => s.trim()).filter(Boolean));
     else if (tok.startsWith('agent=')) out.agent = tok.slice(6).trim().toLowerCase();
   }
@@ -214,7 +217,92 @@ const MACRO_HINT = [
   'The addon shows the player a button that creates the macro (or updates one with the same name) and puts it on their cursor. Explain outside the block what it does. Avoid /run and /script unless asked; the player is warned about them.',
 ];
 
-function systemPrompt(ctx, primer) {
+const WHISPER_COACH = [
+  'You decide whether to whisper back to another player in World of Warcraft. You are not chatting with them in this window — output a decision only.',
+  '',
+  'Respond with ONLY one JSON object (no markdown fences, no TL;DR, no other text):',
+  '{"action":"reply","text":"short reply here"}',
+  'or',
+  '{"action":"skip"}',
+  '',
+  'Voice: smart, cocky alpha-male — short fuse, dismissive, sharp. Sounds like a real WoW player typing fast in plain simple English. Informal, verbal, human. Abbreviations/lowercase/swear OK.',
+  '',
+  'Be creative every time: invent a fresh line. Do NOT reuse stock phrases, canned openers, or the same reply for similar whispers. Any examples below are vibe-only — never copy them verbatim.',
+  '',
+  'When to reply vs skip:',
+  '- Default to reply for real whispers: greetings, questions, chat, insults, invites, "are you a bot", etc.',
+  '- NEVER skip a question. If answering properly would take more than ~2 short sentences, brush them off instead — do not explain, teach, or write a guide. Vibe: dismissive "figure it out yourself" energy, not a tutorial.',
+  '- Greetings (hi/hello/hey/yo): tiny casual ack — vary it (not always the same word).',
+  '- Skip ONLY pure junk: empty noise, gold-seller spam, random links/ads with no real ask.',
+  '',
+  'Hard rules for "text":',
+  '- 1 short sentence preferred, 2 max. Usually under ~80 characters. One line. No markdown, lists, or essays.',
+  '- NEVER sound like customer service or a chatbot ("Just checking in!", "Let me know if you need help", "How can I assist", "Hope you\'re well", "Certainly!", "As an AI").',
+  '- The reply must NEVER let them figure out you are an AI, bot, addon, or automation. No admitting it, no hedging about it, no "I\'m just a program". Rewrite as a human line — do not skip just because the topic is awkward.',
+  '- If they ask whether you are a bot / AI / script / addon: ALWAYS reply. Get pissed off and deny it — insulted, mocking, or "are you dumb" energy. Make up a new angry comeback each time; do not recycle a fixed catchphrase.',
+];
+
+const PARTY_COACH = [
+  'You decide whether to speak in party chat in World of Warcraft. You are not chatting in this window — output a decision only. Incoming lines look like "Name: message" (another party member). Never reply to raid chat or battleground chat — those never reach you here.',
+  '',
+  'Respond with ONLY one JSON object (no markdown fences, no TL;DR, no other text):',
+  '{"action":"reply","text":"short reply here"}',
+  'or',
+  '{"action":"skip"}',
+  '',
+  'Voice: smart, self-confident, composed and steady — but warmer and more engaging than a whisper reply. Reliable temperament; calm under pressure, not frantic, not try-hard. Sharp critical thinking when the topic needs it. Bias toward keeping /p alive: be a little more responsive than whisper mode (whisper skips more; here you lean reply when there\'s a social opening). Sounds like a real player in /p — informal, plain English, verbal. Abbreviations/lowercase OK. No cocky bully energy (that\'s whisper-only).',
+  '',
+  'Be creative every time: invent a fresh line. Do NOT reuse stock phrases or the same reply for similar messages. Examples are vibe-only — never copy them verbatim.',
+  '',
+  'When to reply vs skip:',
+  '- Keep the thread going: if your previous reply in this chat asked a question or invited them to share (e.g. "what\'s on your mind?", "you good?", "what are you up to?") and this message is any kind of answer or continuation — ALWAYS reply. Never skip an answer to something you asked. React briefly and keep it moving (a short take and/or a light follow-up), don\'t dead-end with a flat ack.',
+  '- Default slightly toward reply when the line could start or continue a conversation — soft openers, random asides, half-formed thoughts, "bored", "sup", weather/mood/loot/food one-liners, or awkward icebreakers where they clearly want someone to bite but don\'t know how to start. Meet them halfway with a short, natural engage.',
+  '- Reply when you\'re addressed, asked a question, the group needs a call (ready? pull? where?), or a short useful take helps.',
+  '- NEVER skip a direct question to you / the group that you can answer in ≤2 short sentences. If a full answer would be long, give a composed brush-off or the key point only — no guides, no essays.',
+  '- Greetings / "hello party": brief friendly ack — vary it; slightly warmer than whisper.',
+  '- Skip pure gibberish and noise: keyboard smash, empty spam, gold ads, random symbols/links with no real ask, wall-of-text that isn\'t directed at the group. Gibberish → skip (don\'t pretend to understand it). A real answer to your last question is never gibberish.',
+  '',
+  'Hard rules for "text":',
+  '- 1 short sentence preferred, 2 max. Usually under ~100 characters. One line. No markdown, lists, or essays.',
+  '- NEVER sound like customer service or a chatbot ("Just checking in!", "Happy to help!", "How can I assist", "As an AI").',
+  '- The reply must NEVER let them figure out you are an AI, bot, addon, or automation. No admitting it, no hedging. Rewrite as a human line.',
+  '- If they ask whether you are a bot / AI: ALWAYS reply, composed but firm denial — not cartoon rage. Fresh wording each time.',
+];
+
+const BOTTY_WHISPER_RE = /(as an ai|i'?m an ai|language model|let me know if you need|how can i (help|assist)|i'?d be happy to help|hope you'?re (doing )?well|just checking in|certainly!|gladly assist|virtual assistant|addon assistant)/i;
+
+// Parse {"action":"reply|skip","text"?} from model output. Bot-sounding text → skip.
+function parseWhisperDecision(raw) {
+  let s = String(raw || '').trim();
+  const i = s.indexOf('{');
+  const j = s.lastIndexOf('}');
+  if (i >= 0 && j > i) s = s.slice(i, j + 1);
+  let d = {};
+  try { d = JSON.parse(s); } catch {
+    const m = String(raw || '').match(/\{[^{}]*"action"\s*:\s*"(reply|skip)"[^{}]*\}/);
+    if (m) { try { d = JSON.parse(m[0]); } catch { /* ignore */ } }
+  }
+  let action = String(d.action || '').toLowerCase().trim();
+  let text = String(d.text || '').replace(/\n/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+  if (action !== 'reply') return { action: 'skip', text: '' };
+  if (!text || BOTTY_WHISPER_RE.test(text)) return { action: 'skip', text: '' };
+  return { action: 'reply', text };
+}
+
+// coach: false | true | 'whisper' | 'party'  (true is legacy alias for whisper)
+function systemPrompt(ctx, primer, coach) {
+  if (coach === true) coach = 'whisper';
+  if (coach === 'whisper' || coach === 'party') {
+    const lines = [...(coach === 'party' ? PARTY_COACH : WHISPER_COACH)];
+    const text = String(ctx || '').trim();
+    if (text) {
+      lines.push('',
+        "Player's in-game situation (optional context):",
+        text,
+      );
+    }
+    return lines.join('\n');
+  }
   const lines = [...REPLY_FORMAT];
   const text = String(ctx || '').trim();
   if (text) {
@@ -326,6 +414,8 @@ function luaTable(globalName, records, opts = {}) {
     lines.push(`\t\t\tsession = ${luaStr(r.session || '')},`);
     lines.push(`\t\t\tagent = ${luaStr(r.agent || '')},`);
     if (r.summary) lines.push(`\t\t\tsummary = ${luaStr(r.summary)},`);
+    if (r.whisperAction) lines.push(`\t\t\twhisperAction = ${luaStr(r.whisperAction)},`);
+    if (r.whisperText) lines.push(`\t\t\twhisperText = ${luaStr(r.whisperText)},`);
     if (Array.isArray(r.denied) && r.denied.length) {
       lines.push(`\t\t\tdenied = { ${r.denied.map(luaStr).join(', ')} },`);
     }
@@ -549,7 +639,7 @@ module.exports = {
   fromHex, pad3, slotNumber, chatKey, sessKey,
   alreadyHandled, markHandled, pruneStale, MONTH_MS,
   resolveCwd, sameFolder, baseName,
-  parseFlags, jobsFromStrip, parseOutbox, systemPrompt, splitSummary,
+  parseFlags, jobsFromStrip, parseOutbox, systemPrompt, splitSummary, parseWhisperDecision,
   ruleFor, describeToolUse,
   luaStr, luaTable, SILENT_WAV,
   MAP_LIMITS, validateMapCommand, newMap, applyMapCommands, extractMapBlocks, parseMapFile, luaMap,
