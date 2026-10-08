@@ -13,12 +13,14 @@ test('luaStr escapes everything Lua 5.1 needs', () => {
 });
 
 test('parseFlags reads new-session, hello, forget, context, agent and allow lists', () => {
-  const none = { newSession: false, hello: false, forget: false, context: false, allow: [], agent: '' };
+  const none = { newSession: false, hello: false, forget: false, context: false, whisperHelp: false, partyHelp: false, allow: [], agent: '' };
   assert.deepEqual(P.parseFlags(''), none);
   assert.deepEqual(P.parseFlags('n'), { ...none, newSession: true });
   assert.deepEqual(P.parseFlags('h'), { ...none, hello: true });
   assert.deepEqual(P.parseFlags('d'), { ...none, forget: true });
   assert.deepEqual(P.parseFlags('h;c'), { ...none, hello: true, context: true });
+  assert.deepEqual(P.parseFlags('w'), { ...none, whisperHelp: true });
+  assert.deepEqual(P.parseFlags('p'), { ...none, partyHelp: true });
   assert.deepEqual(P.parseFlags('n;allow=WebSearch, Bash(git:*),'), { ...none, newSession: true, allow: ['WebSearch', 'Bash(git:*)'] });
   assert.deepEqual(P.parseFlags('agent=Codex'), { ...none, agent: 'codex' });
   assert.deepEqual(P.parseFlags('n;agent=grok;allow=WebSearch'), { ...none, newSession: true, agent: 'grok', allow: ['WebSearch'] });
@@ -28,7 +30,7 @@ test('jobsFromStrip parses the current record format and keeps separators inside
   const rec = ['sess', 'chat1', '12', 'realms', 'allow=WebSearch', 'My chat', 'hello\x1Fworld'].join('\x1F');
   const jobs = P.jobsFromStrip(12, rec);
   assert.equal(jobs.length, 1);
-  assert.deepEqual(jobs[0], { session: 'sess', chat: 'chat1', id: 12, cwd: 'realms', newSession: false, hello: false, forget: false, context: false, allow: ['WebSearch'], agent: '', name: 'My chat', text: 'hello\x1Fworld', via: 'pixel' });
+  assert.deepEqual(jobs[0], { session: 'sess', chat: 'chat1', id: 12, cwd: 'realms', newSession: false, hello: false, forget: false, context: false, whisperHelp: false, partyHelp: false, allow: ['WebSearch'], agent: '', name: 'My chat', text: 'hello\x1Fworld', via: 'pixel' });
   // A chat that picked its own agent says so in the flags.
   const codex = P.jobsFromStrip(13, ['sess', 'chat1', '13', '', 'agent=codex', 'My chat', 'hi'].join('\x1F'))[0];
   assert.equal(codex.agent, 'codex');
@@ -77,6 +79,19 @@ test('systemPrompt always asks for the TL;DR block, and wraps the game context a
   const withPrimer = P.systemPrompt('Character: Testchar', '# Primer\n\nUse local.');
   assert.ok(withPrimer.endsWith('Reference for writing addons and macros for this client. Follow it when the task is about WoW, and check anything it marks as uncertain against the Blizzard UI source it names:\n\n# Primer\n\nUse local.'));
   assert.ok(!P.systemPrompt('', '# Primer').includes('# Primer'));
+  const whisper = P.systemPrompt('', '', true);
+  assert.ok(whisper.includes('"action":"reply"') && whisper.includes('NEVER skip a question'), 'whisper coach when flag set');
+  assert.ok(whisper.includes('Be creative every time') && whisper.includes('are you a bot'), 'creativity + bot rules');
+  assert.ok(whisper.includes('Just checking in!'), 'bans customer-service phrasing');
+  assert.ok(!whisper.includes('fvck no are you stupid'), 'no hardcoded comeback lines');
+  assert.ok(!P.systemPrompt('').includes('"action":"reply"'), 'no whisper coach by default');
+  assert.deepEqual(P.parseWhisperDecision('{"action":"reply","text":"yo"}'), { action: 'reply', text: 'yo' });
+  assert.deepEqual(P.parseWhisperDecision('{"action":"reply","text":"Just checking in!"}'), { action: 'skip', text: '' });
+  assert.deepEqual(P.parseWhisperDecision('{"action":"reply","text":"fvck no are you stupid?"}'), { action: 'reply', text: 'fvck no are you stupid?' });
+  assert.deepEqual(P.parseWhisperDecision('{"action":"skip"}'), { action: 'skip', text: '' });
+  const party = P.systemPrompt('', '', 'party');
+  assert.ok(party.includes('composed and steady') && party.includes('party chat'), 'party coach');
+  assert.ok(!party.includes('cocky alpha-male'), 'party voice is not whisper voice');
 });
 
 test('splitSummary takes the last TL;DR block for the game chat and keeps the whole reply for the window', () => {

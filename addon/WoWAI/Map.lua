@@ -17,6 +17,7 @@ local CIRCLE = "Interface\\CHARACTERFRAME\\TempPortraitAlphaMask"
 local ARROW = "Interface\\Minimap\\MinimapArrow"
 local CONTINENT = (Enum and Enum.UIMapType and Enum.UIMapType.Continent) or 2
 local atan2 = math.atan2 or math.atan -- Lua 5.1 in game; 5.3 in the test VM
+local HAS_CMAP = type(C_Map) == "table" and type(C_Map.GetMapInfo) == "function"
 
 local KIND_COLOR = {
 	ore = { 0.95, 0.6, 0.25 }, herb = { 0.35, 0.95, 0.35 }, quest = { 1, 0.85, 0 }, turnin = { 0.35, 0.8, 1 },
@@ -64,6 +65,7 @@ end
 
 local continentOf = {}
 local function ContinentOf(mapID)
+	if not HAS_CMAP then return end
 	if continentOf[mapID] ~= nil then return continentOf[mapID] or nil end
 	local id, guard = mapID, 0
 	while id and id > 0 and guard < 10 do
@@ -77,6 +79,7 @@ end
 
 -- Where mapID's (x, y) (0-1) falls on `target` (0-1), or nil if it doesn't.
 local function Project(mapID, x, y, target)
+	if not HAS_CMAP then return end
 	if mapID == target then return x, y end
 	local minX, maxX, minY, maxY = Try(C_Map.GetMapRectOnMap, mapID, target)
 	if type(minX) == "number" and maxX ~= minX and maxY ~= minY then
@@ -92,6 +95,7 @@ end
 -- Continent-space size in yards, measured from the engine's own map->world transform.
 local continentSize = {}
 local function ContinentYards(cont)
+	if not HAS_CMAP then return end
 	if continentSize[cont] then return continentSize[cont][1], continentSize[cont][2] end
 	local w, h
 	if C_Map.GetWorldPosFromMapPos and CreateVector2D then
@@ -113,6 +117,7 @@ end
 
 -- The player's position as (continent, cx, cy) in continent map space.
 local function PlayerOnContinent()
+	if not HAS_CMAP then return end
 	local mapID = Try(C_Map.GetBestMapForUnit, "player")
 	if not mapID then return end
 	local pos = Try(C_Map.GetPlayerMapPosition, mapID, "player")
@@ -173,7 +178,7 @@ local function NewPin(size)
 	b.num:SetTextColor(0, 0, 0)
 	b:SetScript("OnEnter", ShowTip)
 	b:SetScript("OnLeave", function() GameTooltip:Hide() end)
-	b:RegisterForClicks("LeftButtonUp")
+	b:RegisterForClicks("LeftButton")
 	b:SetScript("OnClick", function(self)
 		if self.info and self.info.layer then M.Navigate(self.info.layer, self.info.index) end
 	end)
@@ -202,7 +207,7 @@ local function AddLine(x1, y1, x2, y2, color, thickness)
 	end
 	local w, h = overlay:GetWidth(), overlay:GetHeight()
 	l:SetThickness(thickness)
-	l:SetColorTexture(color[1], color[2], color[3], 0.75)
+	WoWAI_Compat.SetSolidColor(l, color[1], color[2], color[3], 0.75)
 	l:SetStartPoint("TOPLEFT", overlay, x1 * w, -y1 * h)
 	l:SetEndPoint("TOPLEFT", overlay, x2 * w, -y2 * h)
 	l:Show()
@@ -266,12 +271,18 @@ local function DrawNodes(mapID, scale)
 end
 
 function M.Refresh()
-	if not overlay or not WorldMapFrame:IsShown() then return end
+	if not overlay then SetupWorldMap() end
+	if not overlay then return end
+	local mapShown = (WorldMapFrame and WorldMapFrame.IsShown and WorldMapFrame:IsShown())
+		or (WorldMapFrame and WorldMapFrame:IsVisible())
+	if not mapShown then return end
 	for i = 1, pinCount do pins[i]:Hide() end
 	for i = 1, lineCount do lines[i]:Hide() end
 	for i = 1, nodeCount do nodePins[i]:Hide() end
 	pinCount, lineCount, nodeCount = 0, 0, 0
-	local mapID = WorldMapFrame:GetMapID()
+	-- World-map pin projection needs C_Map (not on 3.3.5a). Layers still sync for slash status.
+	if not HAS_CMAP then return end
+	local mapID = WorldMapFrame.GetMapID and WorldMapFrame:GetMapID()
 	if not mapID then return end
 	local scale = 1 / CanvasScale()
 	overlay.drawnScale = CanvasScale()
@@ -285,7 +296,7 @@ function M.Refresh()
 				local inside = x and x >= 0 and x <= 1 and y >= 0 and y <= 1
 				if inside then
 					local color = KIND_COLOR[p[5]] or KIND_COLOR.poi
-					if l.ordered and prev then AddLine(prev[1], prev[2], x, y, color, 2.5 * scale) end
+					if l.ordered and prev and overlay.CreateLine then AddLine(prev[1], prev[2], x, y, color, 2.5 * scale) end
 					pinCount = pinCount + 1
 					local b = pins[pinCount]
 					if not b then b = NewPin(PIN_SIZE); pins[pinCount] = b end
@@ -302,8 +313,7 @@ function M.Refresh()
 					prev = nil
 				end
 			end
-			-- A loop closes back to its first stop.
-			if l.loop and l.ordered and prev and first and #l.points > 2 then
+			if l.loop and l.ordered and prev and first and #l.points > 2 and overlay.CreateLine then
 				AddLine(prev[1], prev[2], first[1], first[2], first[3], 2.5 * scale)
 			end
 		end
@@ -311,19 +321,33 @@ function M.Refresh()
 end
 
 local function SetupWorldMap()
-	if overlay or not WorldMapFrame or not WorldMapFrame.GetCanvas then return end
-	local canvas = WorldMapFrame:GetCanvas()
+	if overlay then return end
+	-- Forever / modern: WorldMapFrame:GetCanvas(). 3.3.5a: WorldMapDetailFrame.
+	local canvas
+	if WorldMapFrame and WorldMapFrame.GetCanvas then
+		canvas = WorldMapFrame:GetCanvas()
+	elseif WorldMapDetailFrame then
+		canvas = WorldMapDetailFrame
+	end
+	if not canvas then return end
+	-- Pin projection needs C_Map; without it we still attach but Refresh draws nothing.
 	overlay = CreateFrame("Frame", nil, canvas)
 	overlay:SetAllPoints(canvas)
-	overlay:SetFrameLevel(canvas:GetFrameLevel() + 2000)
-	hooksecurefunc(WorldMapFrame, "OnMapChanged", M.Refresh)
-	WorldMapFrame:HookScript("OnShow", M.Refresh)
-	-- Keep pins the same size on screen while zooming.
+	overlay:SetFrameLevel((canvas.GetFrameLevel and canvas:GetFrameLevel() or 0) + 20)
+	if WorldMapFrame and WorldMapFrame.OnMapChanged then
+		hooksecurefunc(WorldMapFrame, "OnMapChanged", M.Refresh)
+	end
+	if WorldMapFrame and WorldMapFrame.HookScript then
+		WorldMapFrame:HookScript("OnShow", M.Refresh)
+	end
+	local ev = CreateFrame("Frame")
+	ev:RegisterEvent("WORLD_MAP_UPDATE")
+	ev:SetScript("OnEvent", function() M.Refresh() end)
 	overlay:SetScript("OnUpdate", function(self, elapsed)
 		self.t = (self.t or 0) + elapsed
 		if self.t < 0.1 then return end
 		self.t = 0
-		if math.abs(CanvasScale() - (self.drawnScale or 0)) > 0.01 then M.Refresh() end
+		if HAS_CMAP and math.abs(CanvasScale() - (self.drawnScale or 0)) > 0.01 then M.Refresh() end
 	end)
 end
 
@@ -342,7 +366,7 @@ local function NavPoint()
 end
 
 local function BuildNavigator()
-	nav = CreateFrame("Frame", "WoWAINavigator", UIParent, "BackdropTemplate")
+	nav = CreateFrame("Frame", "WoWAINavigator", UIParent)
 	nav:SetSize(250, 44)
 	nav:SetBackdrop({ bgFile = "Interface\\Tooltips\\UI-Tooltip-Background", edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", tile = true, tileSize = 16, edgeSize = 12, insets = { left = 3, right = 3, top = 3, bottom = 3 } })
 	nav:SetBackdropColor(0, 0, 0, 0.7)
@@ -505,6 +529,9 @@ local function Status()
 	local n = mdb.nodes
 	Print(string.format("nodes: ore %s, herb %s, filter %s%s", n.ore and "on" or "off", n.herb and "on" or "off", n.filter, WoWAINodes and "" or "  (WoWAI_Nodes data addon not installed)"))
 	Print("commands: /wow-ai map ore|herb [on|off], filter all|skill, show|hide <layer>, nav <layer> [n], next, prev, stop  (/aimap is the same)")
+	if not HAS_CMAP then
+		Print("note: world-map pins need C_Map (not available on 3.3.5a); layer data still syncs for status above")
+	end
 end
 
 function M.Command(msg)

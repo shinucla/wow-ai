@@ -34,7 +34,7 @@ function newVM() {
   };
   const num = (expr) => Number(evaluate(expr));
   run(fs.readFileSync(path.join(__dirname, 'wow_stub.lua'), 'utf8'));
-  for (const f of ['Codec.lua', 'Inbox.lua', 'WoWAI.lua']) run(fs.readFileSync(path.join(ADDON, f), 'utf8'), 'WoWAI');
+  for (const f of ['Compat.lua', 'Codec.lua', 'Inbox.lua', 'WoWAI.lua']) run(fs.readFileSync(path.join(ADDON, f), 'utf8'), 'WoWAI');
   return { run, evaluate, num };
 }
 
@@ -119,7 +119,7 @@ test('hello goes out on the strip after login', () => {
   vm.run('STUB.RunTimers()'); // C_Timer.After(3, SayHello)
   const recs = stripRecords(vm);
   assert.equal(recs.length, 1);
-  assert.equal(recs[0].flags, 'h;c', 'a hello always carries the game context');
+  assert.equal(recs[0].flags, 'h;i=1;c', 'a hello always carries the game context');
   assert.equal(recs[0].text, '');
   assert.equal(recs[0].session, vm.evaluate('WoWAIDB.session'));
 });
@@ -133,7 +133,7 @@ test('outbound records replace field separators inside user text', () => {
   assert.ok(rec, 'the record keeps the full message as one wire field');
 });
 
-test('the game context describes the character and rides on the hello, then only when it changes or is turned off', () => {
+test('the game context describes the character and rides on every assist send', () => {
   const vm = newVM();
   login(vm);
   vm.run('STUB.RunTimers()');
@@ -147,33 +147,33 @@ test('the game context describes the character and rides on the hello, then only
     'Talents: Beast Mastery 10 / Marksmanship 5 / Survival 0',
     'Professions: Skinning 75/75, First Aid 40/75',
   ]);
-  // The bridge answers the hello: the context is now known to be on its side.
+  // The bridge answers the hello.
   nextSlot(vm, '{ now = time(), cwd = "", replies = {} }');
   vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
   assert.equal(vm.evaluate('WoWAI.IsConnected()'), 'true');
+  // Assist always re-ships context (so "where am I?" works after a bridge restart).
   vm.run('WoWAI.Send("hello world")');
   let rec = stripRecords(vm).find(r => r.text === 'hello world');
-  assert.equal(rec.flags, '', 'unchanged context is not repeated');
-  assert.equal(rec.ctx, undefined);
-  assert.equal(vm.evaluate('WoWAIDB.outbox.ctx'), null);
-  // Moving to another zone changes it, so the next message (from another chat,
-  // the first one is still waiting) carries the new version.
+  assert.equal(rec.flags, 'i=1;c', 'assist always sends context');
+  assert.ok(rec.ctx.includes('Location: Duskwood - Darkshire'), rec.ctx);
+  assert.ok(vm.evaluate('WoWAIDB.outbox.ctx'), 'the reload path carries it too');
+  // Moving to another zone: the next message carries the new location.
   vm.run('STUB.zone = "Elwynn Forest"; STUB.subzone = ""; STUB.posX = 0.1; WoWAI.NewChat("Second"); WoWAI.Send("where am I")');
   rec = stripRecords(vm).find(r => r.text === 'where am I');
-  assert.equal(rec.flags, 'c');
+  assert.equal(rec.flags, 'i=1;c');
   assert.ok(rec.ctx.includes('Location: Elwynn Forest\n'), rec.ctx);
   assert.ok(rec.ctx.includes('Position: 10.0, 67.8 on Duskwood (map 1431)'), 'the map name shows when it differs from the zone');
   assert.equal(Buffer.from(vm.evaluate('WoWAIDB.outbox.ctx'), 'hex').toString('utf8'), rec.ctx, 'the reload path carries it too');
   // Turning it off sends an empty context at once (a hello), so the bridge drops what it had.
   vm.run('SlashCmdList.WOWAI("context off")');
   assert.equal(vm.evaluate('WoWAIDB.settings.context'), 'false');
-  const off = stripRecords(vm).filter(r => r.flags === 'h;c');
+  const off = stripRecords(vm).filter(r => r.flags === 'h;i=1;c');
   assert.equal(off.length, 1);
   assert.equal(off[0].ctx, '');
   assert.ok(vm.evaluate('WoWAIDB.chats[2].history[#WoWAIDB.chats[2].history].text').includes('Game context is OFF'));
   // Back on: another hello, with the context again.
   vm.run('SlashCmdList.WOWAI("context on")');
-  const on = stripRecords(vm).filter(r => r.flags === 'h;c');
+  const on = stripRecords(vm).filter(r => r.flags === 'h;i=1;c');
   assert.ok(on.some(r => r.ctx.includes('Character: Testchar')));
   assert.ok(vm.evaluate('WoWAIDB.chats[2].history[#WoWAIDB.chats[2].history].text').includes('Game context is ON'));
 });
@@ -227,7 +227,7 @@ test('deleting a chat tells the bridge to forget it, and a restore never brings 
   vm.run(`WoWAI.DeleteChat("${gone}")`);
   assert.equal(vm.num('#WoWAIDB.chats'), 1);
   // A forget record for that chat is on the strip and remembered until acked.
-  const rec = stripRecords(vm).find(r => r.flags === 'd');
+  const rec = stripRecords(vm).find(r => (r.flags || '').split(';').includes('d'));
   assert.ok(rec, 'forget record on the strip');
   assert.equal(rec.chat, gone);
   assert.equal(rec.text, '');
@@ -239,9 +239,9 @@ test('deleting a chat tells the bridge to forget it, and a restore never brings 
   assert.equal(vm.num('#WoWAIDB.chats'), 1, 'deleted chat not restored');
   // The bridge acks the forget record: it leaves the strip and the memory.
   const slot = String(rec.id).padStart(3, '0');
-  vm.run(`STUB.sounds["Interface\\\\AddOns\\\\WoWAI\\\\ack\\\\${slot}.wav"] = true; STUB.Tick()`);
+  vm.run(`STUB.sounds["Interface\\\\AddOns\\\\WoWAI\\\\i01\\\\ack\\\\${slot}.wav"] = true; STUB.Tick()`);
   assert.equal(vm.evaluate(`WoWAIDB.forget["${gone}"]`), null, 'forgotten once acked');
-  assert.ok(!stripRecords(vm).find(r => r.flags === 'd'), 'forget record left the strip');
+  assert.ok(!stripRecords(vm).find(r => (r.flags || '').split(';').includes('d')), 'forget record left the strip');
 });
 
 test('until the bridge answers, Connect replaces Send and a message stays in the box', () => {
@@ -257,7 +257,7 @@ test('until the bridge answers, Connect replaces Send and a message stays in the
   assert.equal(vm.evaluate('WoWAIInput:GetText()'), 'fix the bug', 'message kept in the box');
   const hello = stripRecords(vm);
   assert.equal(hello.length, 1);
-  assert.equal(hello[0].flags, 'h;c', 'a hello went out instead');
+  assert.equal(hello[0].flags, 'h;i=1;c', 'a hello went out instead');
   assert.ok(texts().includes('Connecting...'));
   assert.ok(texts().includes('your message goes out as soon as it answers'));
   // No answer within CONNECT_WAIT: the attempt is reported as failed, Connect is back.
@@ -358,7 +358,7 @@ test('a sent message is encoded on the strip with the chat folder, then a slot r
   assert.equal(rec.chat, chatId);
   assert.equal(rec.id, id);
   assert.equal(rec.cwd, 'realms');
-  assert.equal(rec.flags, '');
+  assert.equal(rec.flags, 'i=1;c');
   // The chat took its title from the first message.
   assert.equal(vm.evaluate('WoWAIDB.chats[1].name'), 'Hello world');
 
@@ -389,7 +389,7 @@ test('a denied reply shows Allow, and Allow resends with the rules as flags', ()
   vm.run(`WoWAI.Allow("${chatId}", { "WebSearch", "Bash(cargo:*)" })`);
   const rec = stripRecords(vm).find(r => r.flags.includes('allow='));
   assert.ok(rec, 'allow record on the strip');
-  assert.equal(rec.flags, 'allow=WebSearch,Bash(cargo:*)');
+  assert.equal(rec.flags, 'allow=WebSearch,Bash(cargo:*);i=1;c');
   assert.equal(rec.id, id + 1);
 });
 
@@ -408,7 +408,7 @@ test('a chat can pick its agent: the strip says so, replies are labelled by thei
   vm.run('WoWAI.Send("hello")');
   const chatId = vm.evaluate('WoWAIDB.chats[1].id');
   let rec = stripRecords(vm).find(r => r.text === 'hello');
-  assert.equal(rec.flags, '');
+  assert.equal(rec.flags, 'i=1;c');
   assert.equal(vm.evaluate('WoWAIDB.outbox.agent'), null);
   const id = vm.num('WoWAIDB.chats[1].pendingId');
   nextSlot(vm, slot(`{ chat = "${chatId}", id = ${id}, status = "done", text = "hi", agent = "claude" }`));
@@ -422,7 +422,7 @@ test('a chat can pick its agent: the strip says so, replies are labelled by thei
   assert.ok(vm.evaluate('WoWAIDB.chats[1].history[#WoWAIDB.chats[1].history].text').includes('agent set to Codex'));
   vm.run('WoWAI.Send("now with codex")');
   rec = stripRecords(vm).find(r => r.text === 'now with codex');
-  assert.equal(rec.flags, 'agent=codex');
+  assert.equal(rec.flags, 'agent=codex;i=1;c');
   assert.equal(vm.evaluate('WoWAIDB.outbox.agent'), 'codex');
   assert.ok(texts().includes('agent: Codex   mode: pixel'));
   const id2 = vm.num('WoWAIDB.chats[1].pendingId');
@@ -430,10 +430,10 @@ test('a chat can pick its agent: the strip says so, replies are labelled by thei
   vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
   assert.equal(vm.evaluate('WoWAIDB.chats[1].history[#WoWAIDB.chats[1].history].agent'), 'codex');
   assert.ok(vm.evaluate('table.concat(STUB.prints, "\\n")').includes('[Codex · '));
-  // Resend keeps the agent flag.
+  // Resend keeps the agent flag (context is not re-attached on resend).
   vm.run('WoWAI.Send("again")');
   vm.run('WoWAI.Resend()');
-  assert.equal(stripRecords(vm).find(r => r.text === 'again').flags, 'agent=codex');
+  assert.equal(stripRecords(vm).find(r => r.text === 'again').flags, 'agent=codex;i=1');
   vm.run('SlashCmdList.WOWAI("cancel")');
   // A name the bridge did not list is refused; "default" goes back to the bridge's.
   vm.run('SlashCmdList.WOWAI("agent gemini")');
@@ -527,7 +527,7 @@ test('/wow-ai reset marks the next message as a new session', () => {
   vm.run('SlashCmdList.WOWAI("reset")');
   vm.run('WoWAI.Send("start over")');
   const rec = stripRecords(vm).find(r => r.text === 'start over');
-  assert.equal(rec.flags, 'n');
+  assert.equal(rec.flags, 'n;i=1;c');
   assert.equal(vm.evaluate('WoWAIDB.chats[1].resetNext'), null);
 });
 
@@ -592,6 +592,21 @@ test('game chat echo: the summary by default, the first lines without one, the w
   vm4.run('WoWAIDB = { settings = { echo = "full", echoV2 = true } }');
   login(vm4);
   assert.equal(vm4.evaluate('WoWAIDB.settings.echo'), 'full');
+});
+
+test('wowai: chat links are handled without calling Blizzard SetItemRef (Unknown link type)', () => {
+  const vm = newVM();
+  login(vm);
+  connect(vm);
+  const chatId = vm.evaluate('WoWAIDB.chats[1].id');
+  vm.run('STUB.setItemRefCalls = {}');
+  vm.run(`SetItemRef("wowai:open:${chatId}", "[open]", "LeftButton")`);
+  assert.equal(vm.num('#STUB.setItemRefCalls'), 0, 'blizzard SetItemRef must not run for wowai links');
+  assert.equal(vm.evaluate('WoWAIFrame.shown'), 'true', 'open link shows the window');
+  vm.run('WoWAI.Toggle(false)');
+  vm.run(`SetItemRef("item:19019", "[Thunderfury]", "LeftButton")`);
+  assert.equal(vm.num('#STUB.setItemRefCalls'), 1, 'normal links still reach blizzard');
+  assert.equal(vm.evaluate('STUB.setItemRefCalls[1].link'), 'item:19019');
 });
 
 test('a restore bundle addressed to this session adds the missing chats once', () => {
@@ -714,4 +729,108 @@ test('reload mode writes the outbox for the bridge instead of drawing the strip'
   assert.equal(vm.evaluate('WoWAIDB.outbox.text'), Buffer.from('via reload').toString('hex'));
   assert.equal(Buffer.from(vm.evaluate('WoWAIDB.outbox.allow'), 'hex').toString('utf8'), 'WebSearch\x1fBash(git:*)');
   assert.equal(decodeStrip(vm), null);
+});
+
+test('auto-whisper is off by default and ignores incoming whispers', () => {
+  const vm = newVM();
+  login(vm);
+  connect(vm);
+  assert.equal(vm.evaluate('WoWAIDB.settings.autoWhisper'), 'false');
+  vm.run('STUB.FireEvent("CHAT_MSG_WHISPER", "hey there", "Bob")');
+  assert.equal(vm.num('#WoWAIDB.chats'), 1, 'no whisper chat created while off');
+  assert.equal(vm.evaluate('WoWAIDB.chats[1].pendingId'), null);
+});
+
+test('auto-whisper asks the bridge and sends only on reply decisions', () => {
+  const vm = newVM();
+  login(vm);
+  connect(vm);
+  vm.run('SlashCmdList.WOWAI("autowhisper on")');
+  assert.equal(vm.evaluate('WoWAIDB.settings.autoWhisper'), 'true');
+  const activeBefore = vm.evaluate('WoWAIDB.activeChat');
+  vm.run('STUB.FireEvent("CHAT_MSG_WHISPER", "hello", "Jesanext")');
+  assert.equal(vm.num('#WoWAIDB.chats'), 2);
+  assert.equal(vm.evaluate('WoWAIDB.chats[2].name'), 'W: Jesanext');
+  assert.equal(vm.evaluate('WoWAIDB.chats[2].whisperFrom'), 'Jesanext');
+  assert.equal(vm.evaluate('WoWAIDB.activeChat'), activeBefore, 'active chat is not stolen');
+  const pending = vm.num('WoWAIDB.chats[2].pendingId');
+  assert.ok(pending > 0, 'whisper is sent to the bridge');
+  assert.equal(vm.evaluate('WoWAIDB.chats[2].history[1].role'), 'user');
+  assert.equal(vm.evaluate('WoWAIDB.chats[2].history[1].text'), 'hello');
+  const chatId = vm.evaluate('WoWAIDB.chats[2].id');
+  const rec = stripRecords(vm).find(r => r.text === 'hello' && r.name === 'W: Jesanext');
+  assert.ok(rec, 'whisper job on the strip');
+  assert.ok((rec.flags || '').split(';').includes('w'), 'whisper-help flag w is set: ' + rec.flags);
+  assert.equal(vm.num('#STUB.whispers'), 0, 'nothing whispered yet');
+
+  // Bridge says reply → outbound whisper.
+  nextSlot(vm, `{ now = time(), cwd = "", replies = { { chat = "${chatId}", id = ${pending}, status = "done", text = "yo", whisperAction = "reply", whisperText = "yo", agent = "claude" } } }`);
+  vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
+  assert.equal(vm.num('#STUB.whispers'), 1);
+  assert.equal(vm.evaluate('STUB.whispers[1].msg'), 'yo');
+  assert.equal(vm.evaluate('STUB.whispers[1].chatType'), 'WHISPER');
+  assert.equal(vm.evaluate('STUB.whispers[1].target'), 'Jesanext');
+  assert.equal(vm.evaluate('WoWAIDB.chats[2].pendingId'), null);
+  assert.equal(vm.evaluate('WoWAIDB.chats[2].replyWhisper'), null);
+
+  // Next whisper: bridge skips → no new outbound whisper.
+  vm.run('STUB.FireEvent("CHAT_MSG_WHISPER", "inv for icc?", "Jesanext")');
+  const pending2 = vm.num('WoWAIDB.chats[2].pendingId');
+  assert.ok(pending2 > 0);
+  nextSlot(vm, `{ now = time(), cwd = "", replies = { { chat = "${chatId}", id = ${pending2}, status = "done", text = "skip", whisperAction = "skip", agent = "claude" } } }`);
+  vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
+  assert.equal(vm.num('#STUB.whispers'), 1, 'skip does not whisper');
+});
+
+test('typing in a whisper tab uses assist, not the whisper persona', () => {
+  const vm = newVM();
+  login(vm);
+  connect(vm);
+  vm.run('SlashCmdList.WOWAI("autowhisper on")');
+  vm.run('STUB.FireEvent("CHAT_MSG_WHISPER", "yo", "Bob")');
+  const wPending = vm.num('WoWAIDB.chats[2].pendingId');
+  const wChat = vm.evaluate('WoWAIDB.chats[2].id');
+  nextSlot(vm, `{ now = time(), cwd = "", replies = { { chat = "${wChat}", id = ${wPending}, status = "done", text = "skip", whisperAction = "skip", agent = "claude" } } }`);
+  vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
+  // User switches to the W: tab and asks the AI about themselves.
+  vm.run('WoWAI.SwitchChat(WoWAIDB.chats[2].id)');
+  vm.run('STUB.zone = "Dalaran"; WoWAI.Send("where am I?")');
+  const rec = stripRecords(vm).find(r => r.text === 'where am I?');
+  assert.ok(rec, 'manual message on the strip');
+  assert.ok(!(rec.flags || '').split(';').includes('w'), 'manual typing must not set whisper flag: ' + rec.flags);
+  assert.ok((rec.flags || '').split(';').includes('c'), 'assist send carries game context: ' + rec.flags);
+  assert.ok((rec.ctx || '').includes('Location: Dalaran'), 'context has location');
+});
+
+test('auto-party asks the bridge and sends only on reply decisions', () => {
+  const vm = newVM();
+  login(vm);
+  connect(vm);
+  vm.run('SlashCmdList.WOWAI("autoparty on")');
+  assert.equal(vm.evaluate('WoWAIDB.settings.autoParty'), 'true');
+  const activeBefore = vm.evaluate('WoWAIDB.activeChat');
+  vm.run('STUB.FireEvent("CHAT_MSG_PARTY", "ready?", "Bob")');
+  assert.equal(vm.num('#WoWAIDB.chats'), 2);
+  assert.equal(vm.evaluate('WoWAIDB.chats[2].name'), 'Party');
+  assert.equal(vm.evaluate('WoWAIDB.chats[2].partyChat'), 'true');
+  assert.equal(vm.evaluate('WoWAIDB.activeChat'), activeBefore, 'active chat is not stolen');
+  const pending = vm.num('WoWAIDB.chats[2].pendingId');
+  assert.ok(pending > 0, 'party line is sent to the bridge');
+  assert.equal(vm.evaluate('WoWAIDB.chats[2].history[1].text'), 'Bob: ready?');
+  const chatId = vm.evaluate('WoWAIDB.chats[2].id');
+  const rec = stripRecords(vm).find(r => r.text === 'Bob: ready?');
+  assert.ok(rec, 'party job on the strip');
+  assert.ok((rec.flags || '').split(';').includes('p'), 'party flag p is set: ' + rec.flags);
+  assert.equal(vm.num('#STUB.whispers'), 0);
+
+  nextSlot(vm, `{ now = time(), cwd = "", replies = { { chat = "${chatId}", id = ${pending}, status = "done", text = "ready", whisperAction = "reply", whisperText = "ready", agent = "claude" } } }`);
+  vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
+  assert.equal(vm.num('#STUB.whispers'), 1);
+  assert.equal(vm.evaluate('STUB.whispers[1].msg'), 'ready');
+  assert.equal(vm.evaluate('STUB.whispers[1].chatType'), 'PARTY');
+
+  // Raid chat must not trigger auto-party.
+  vm.run('STUB.FireEvent("CHAT_MSG_RAID", "pulling", "Bob")');
+  assert.equal(vm.evaluate('WoWAIDB.chats[2].pendingId'), null);
+  assert.equal(vm.num('#STUB.whispers'), 1);
 });

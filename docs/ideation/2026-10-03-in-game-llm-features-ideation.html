@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Ideation: in-game LLM features</title>
+<style>
+:root {
+  --bg: #0f1419; --panel: #1a222c; --text: #e7ecf1; --muted: #9aa7b5;
+  --accent: #c4a35a; --border: #2c3642; --ok: #6fbf8a; --warn: #d4a574;
+  --font: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  --mono: "IBM Plex Mono", "Consolas", monospace;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: linear-gradient(160deg, #0c1015 0%, #15202b 50%, #0f1419 100%);
+  color: var(--text); font: 16px/1.55 var(--font); }
+header { padding: 2.5rem 1.5rem 1.5rem; border-bottom: 1px solid var(--border);
+  background: radial-gradient(ellipse at 20% 0%, #2a2114 0%, transparent 55%); }
+header h1 { margin: 0 0 0.4rem; font-size: 1.85rem; letter-spacing: 0.02em; color: var(--accent); }
+.meta { color: var(--muted); font-size: 0.92rem; }
+main { max-width: 820px; margin: 0 auto; padding: 1.5rem; }
+h2 { margin-top: 2.2rem; font-size: 1.25rem; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 0.35rem; }
+h3 { margin: 0 0 0.5rem; font-size: 1.15rem; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 1.1rem 1.25rem; margin: 1rem 0; }
+.badges { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.5rem 0 0.75rem; }
+.badge { font: 0.75rem/1 var(--mono); padding: 0.3rem 0.55rem; border-radius: 999px;
+  background: #243040; color: var(--muted); border: 1px solid var(--border); }
+.badge.axis { color: #b8d4ef; }
+.badge.high { color: var(--ok); }
+.badge.med { color: var(--warn); }
+ul.jump { columns: 2; gap: 1.5rem; padding-left: 1.2rem; }
+ul.jump a { color: var(--accent); text-decoration: none; }
+ul.jump a:hover { text-decoration: underline; }
+.basis { font-family: var(--mono); font-size: 0.82rem; color: var(--muted); }
+table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+td, th { border-bottom: 1px solid var(--border); padding: 0.45rem 0.35rem; text-align: left; vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+footer { margin: 2.5rem 1.5rem; color: var(--muted); font-size: 0.85rem; text-align: center; }
+code { font-family: var(--mono); font-size: 0.88em; }
+</style>
+</head>
+<body>
+<header>
+  <h1>In-game LLM features</h1>
+  <p class="meta">Ideation · <time datetime="2026-10-03">2026-10-03</time> · topic <code>in-game-llm-features</code><br/>
+  Focus: go-bridge LLM path — seed: BG combat analysis (healers / rotations)<br/>
+  Mode: this codebase (wow-ai addon ↔ Go bridge ↔ LLM)</p>
+</header>
+<main>
+<section id="grounding">
+  <h2>Grounding context</h2>
+  <p>wow-ai already has three non-mixed modes (assist / whisper / party), a ~3.2&nbsp;KB pixel strip, ≤900&nbsp;B game context (self only: zone, talents, quests…), map marks, and macro install buttons. There is <strong>no combat-log pipeline</strong>. Party auto-chat deliberately ignores raid/BG. Assist is the only coaching-fit path. README forbids memory-read / input injection.</p>
+  <p>Outside: WowCoach / ParsePal own <em>post-fight</em> raid coaching; BG/PvP LLM debrief is nearly empty. BattleComm / HHTD show BG telemetry prior art. Strong pattern: compute metrics locally, let the LLM narrate (VLML). Mid-combat LLM callouts are latency- and ToS-hostile; between-fight / post-match is the safe lane.</p>
+</section>
+
+<section id="axes">
+  <h2>Topic axes</h2>
+  <ol>
+    <li>match / combat review</li>
+    <li>between-fight coaching</li>
+    <li>group &amp; PvP callouts</li>
+    <li>open-world guidance</li>
+    <li>character &amp; loadout craft</li>
+  </ol>
+</section>
+
+<section id="ranked">
+  <h2>Ranked ideas</h2>
+  <ul class="jump">
+    <li><a href="#i1">1. Scoreboard Moneyball debrief</a></li>
+    <li><a href="#i2">2. Death autopsy</a></li>
+    <li><a href="#i3">3. Fight ledger + metrics → rotation critique</a></li>
+    <li><a href="#i4">4. Precompute playbook</a></li>
+    <li><a href="#i5">5. Bridge game-data pack</a></li>
+    <li><a href="#i6">6. Context priority packer</a></li>
+    <li><a href="#i7">7. One-shot build / kit audit</a></li>
+  </ul>
+
+  <article class="card" id="i1">
+    <h3>1. Scoreboard Moneyball debrief</h3>
+    <div class="badges">
+      <span class="badge axis">match / combat review</span>
+      <span class="badge high">Conf 85%</span>
+      <span class="badge">Cx Medium</span>
+    </div>
+    <p>At BG/arena end (and optionally mid-match), read <code>GetBattlefieldScore</code> for every player — class, damage, healing, kills, objectives — pack ~12&nbsp;B/player, compute ranks in the bridge, and have the LLM write a short debrief: who carried heals, who padded overkill, who underperformed for their role. Auto-trigger on match end; keep history bridge-side for “vs your last N matches.”</p>
+    <p class="basis">direct: no GetBattlefield* usage in repo today; external: empty BG LLM coach niche; VLML metrics→narrative</p>
+    <p><strong>Why it matters:</strong> This is your seed (“who is the healer?”) without CLEU range limits, and the cheapest end-to-end proof of a match-review product.</p>
+    <p><strong>Downsides:</strong> Healing-done is a heuristic for “healer,” not role API; mid-match scoreboard freshness needs a live check on 3.3.5a.</p>
+  </article>
+
+  <article class="card" id="i2">
+    <h3>2. Death autopsy</h3>
+    <div class="badges">
+      <span class="badge axis">between-fight coaching</span>
+      <span class="badge high">Conf 80%</span>
+      <span class="badge">Cx Medium</span>
+    </div>
+    <p>Keep a short ring buffer of damage/CC taken (and key CDs available). On <code>PLAYER_DEAD</code>, send ~300&nbsp;B. Reply lands on the spirit-healer screen: “3 sources, trinket unused, Frost Nova unbroken.” Use a compact scorecard notation so the payload fits strip/context budgets.</p>
+    <p class="basis">direct: no CLEU/death-recap code; PLAYER_DEAD is free out-of-combat window; strip can deliver while dead</p>
+    <p><strong>Why it matters:</strong> Hits the most emotional coaching moment with tiny engineering vs a full log pipeline.</p>
+    <p><strong>Downsides:</strong> Coarse buffers miss one-shots; notation design is the real product work.</p>
+  </article>
+
+  <article class="card" id="i3">
+    <h3>3. Fight ledger + metrics → rotation critique</h3>
+    <div class="badges">
+      <span class="badge axis">match / combat review</span>
+      <span class="badge high">Conf 75%</span>
+      <span class="badge">Cx High</span>
+    </div>
+    <p>Add a CLEU collector that seals a fixed-size digest at <code>PLAYER_REGEN_ENABLED</code> (casts, interrupts, idle gaps, CD uses — nearby players only). Go computes uptime / interrupt rate / wasted CDs; the LLM only narrates anomalies. Answers “whose rotations need work” for whoever you could see.</p>
+    <p class="basis">direct: CLEU unused but listed in primer; external: WowCoach/ParsePal pattern; reasoned: never ship raw logs through 3.2&nbsp;KB strip</p>
+    <p><strong>Why it matters:</strong> One ledger unlocks debriefs, baselines, and future callout modes; numbers stay trustworthy.</p>
+    <p><strong>Downsides:</strong> CLEU range ≠ whole BG; client event shape needs a Forever vs 3.3.5a check; highest build cost of the set.</p>
+  </article>
+
+  <article class="card" id="i4">
+    <h3>4. Precompute playbook (LLM off the hot path)</h3>
+    <div class="badges">
+      <span class="badge axis">between-fight coaching</span>
+      <span class="badge med">Conf 70%</span>
+      <span class="badge">Cx Medium</span>
+    </div>
+    <p>During BG prep (or before a pull), spend one slot on a short playbook: enemy class mix, focus priorities, 2–3 contingency lines. During the match, local triggers or wav cues print a prewritten line — no mid-fight LLM round trip (5–60&nbsp;s is too slow for callouts).</p>
+    <p class="basis">reasoned: strip/slot latency kills live coaching; architecture already has free wav signals; external: boxing corner / F1 pre-agreed calls</p>
+    <p><strong>Why it matters:</strong> Makes “real-time-feeling” advice possible without pretending the coding-agent CLI is a GCD timer.</p>
+    <p><strong>Downsides:</strong> Wav codebook needs careful index budgeting; bad playbooks hallucinate 3.3.5a spells — keep advice checkable.</p>
+  </article>
+
+  <article class="card" id="i5">
+    <h3>5. Bridge game-data pack</h3>
+    <div class="badges">
+      <span class="badge axis">open-world guidance</span>
+      <span class="badge high">Conf 80%</span>
+      <span class="badge">Cx High</span>
+    </div>
+    <p>Ship (or plug in) a versioned WotLK quest/NPC/coord pack on the bridge. Enrich quest-log IDs from <code>GameContext</code> into titles, objectives, and map points before prompting. Existing <code>wowmap</code> / navigator then draw real routes instead of guessing.</p>
+    <p class="basis">direct: MAP.md — bridge ships no game data; quest context is ids only</p>
+    <p><strong>Why it matters:</strong> Map/route plumbing exists but is starved; one data layer lifts open-world assist dramatically.</p>
+    <p><strong>Downsides:</strong> Data licensing + size; navigator still weak in instances/BGs.</p>
+  </article>
+
+  <article class="card" id="i6">
+    <h3>6. Context priority packer</h3>
+    <div class="badges">
+      <span class="badge axis">open-world guidance</span>
+      <span class="badge high">Conf 90%</span>
+      <span class="badge">Cx Low</span>
+    </div>
+    <p>Replace blind <code>s:sub(1,900)</code> truncation (quests are last → mid-id chops) with a priority packer: character + location first, then whole quest lines or an explicit “N more” marker. Cheap correctness fix that makes every later feature’s prompts saner.</p>
+    <p class="basis">direct: WoWAI.lua CONTEXT_MAX truncation; open-world dossier</p>
+    <p><strong>Why it matters:</strong> Silent data loss today; unlocks trustworthy “what next?” answers.</p>
+    <p><strong>Downsides:</strong> Still only 900&nbsp;B — doesn’t add gear/bars by itself (that’s a later sectioned context design).</p>
+  </article>
+
+  <article class="card" id="i7">
+    <h3>7. One-shot build / kit audit</h3>
+    <div class="badges">
+      <span class="badge axis">character &amp; loadout craft</span>
+      <span class="badge med">Conf 75%</span>
+      <span class="badge">Cx Low</span>
+    </div>
+    <p><code>/wow-ai audit</code> (or an assist command) dumps talent ranks + equipped item links in one &lt;3&nbsp;KB assist send. LLM returns gaps (missing enchants, unspent points, function holes like “no snare break”) and optional <code>wowmacro</code> buttons — reusing the existing install path.</p>
+    <p class="basis">direct: GameContext has tab totals only; gear needs manual shift-clicks today; wowmacro pipeline exists</p>
+    <p><strong>Why it matters:</strong> Safe, non-combat, high-trust use of assist; closes the loop from advice → installable macro.</p>
+    <p><strong>Downsides:</strong> No item DB → avoid inventing bis lists; stick to observable gaps.</p>
+  </article>
+</section>
+
+<section id="rejected">
+  <h2>Rejection summary</h2>
+  <table>
+    <thead><tr><th>Idea</th><th>Why cut</th></tr></thead>
+    <tbody>
+      <tr><td>Always-on telemetry strip</td><td>Strip is an ack’d message envelope, not a stream — burns ids/FPS</td></tr>
+      <tr><td>Crowd-sourced SendAddonMessage merge</td><td>Needs other players on wow-ai + bridge; no network effect</td></tr>
+      <tr><td>Auto NotifyInspect enemy scouting</td><td>Faction/range limits; weak vs scoreboard</td></tr>
+      <tr><td>Broadcast LLM into BG chat</td><td>Latency + spam/ToS; repo excludes BG chat by design</td></tr>
+      <tr><td>Mid-fight live rotation LLM</td><td>5–60&nbsp;s CLI round trips; competitive-advantage smell</td></tr>
+      <tr><td>Local model as “new feature”</td><td>baseURL already supports it — config, not a product idea</td></tr>
+      <tr><td>Readback-hearback / fireground names</td><td>Weak observables / hallucination risk</td></tr>
+      <tr><td>Coach-mode “registry”</td><td>Fix JS ChatKey parity as a bug; registry is premature</td></tr>
+      <tr><td>Post-combat Notify gate alone</td><td>Hygiene only — fold into death/debrief work</td></tr>
+    </tbody>
+  </table>
+  <p>Axis coverage: all five axes have ≥1 survivor. Deliberate gap: no “live PvP callout bot” — rejected on latency/ToS.</p>
+</section>
+</main>
+<footer class="composition-signal">Composed 2026-10-03 by ce-ideate · focus: in-game LLM features via go-bridge (BG combat seed) · scratch /tmp/compound-engineering-1000/ce-ideate/827ace99</footer>
+</body>
+</html>

@@ -81,6 +81,10 @@ function Methods.SetBackdrop(self, t)
 	assert(type(t) == "table", "SetBackdrop called with " .. tostring(t) .. " on " .. tostring(self.name or self.kind))
 	self.backdrop = t
 end
+function Methods.SetChecked(self, v) self.checked = not not v end
+function Methods.GetChecked(self) return self.checked end
+function Methods.Enable(self) self.enabled = true end
+function Methods.Disable(self) self.enabled = false end
 function Methods.SetFocus(self) STUB.focus = self end
 function Methods.ClearFocus(self) if STUB.focus == self then STUB.focus = nil end end
 function Methods.HasFocus(self) return STUB.focus == self end
@@ -169,11 +173,21 @@ C_Texture = { GetAtlasExists = function() return true end }
 function PlaySound() end
 function PlaySoundFile(path) if STUB.sounds[path] then return true, 1 end return false end
 function StopSound() end
+STUB.whispers = {}
+function SendChatMessage(msg, chatType, lang, target)
+	table.insert(STUB.whispers, { msg = msg, chatType = chatType, target = target })
+end
+function BNSendWhisper(id, msg)
+	table.insert(STUB.whispers, { msg = msg, chatType = "BN_WHISPER", target = id })
+end
 function GetPhysicalScreenSize() return 1920, 1080 end
 function SetBinding(key, cmd) STUB.bindings[key] = cmd end
 function SaveBindings() end
 function GetCurrentBindingSet() return 1 end
-function SetItemRef() end
+STUB.setItemRefCalls = {}
+function SetItemRef(link, text, button, ...)
+	table.insert(STUB.setItemRefCalls, { link = link, text = text, button = button })
+end
 -- Nothing of Blizzard's is ever active here, so the link goes nowhere unless the
 -- addon takes it. The Forever client's UI code calls ChatFrameUtil.InsertLink;
 -- ChatEdit_InsertLink is the older global name.
