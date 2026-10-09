@@ -834,3 +834,91 @@ test('auto-party asks the bridge and sends only on reply decisions', () => {
   assert.equal(vm.evaluate('WoWAIDB.chats[2].pendingId'), null);
   assert.equal(vm.num('#STUB.whispers'), 1);
 });
+
+test('auto-say puts each /say line on the strip at once, then speaks the answer in /s', () => {
+  const vm = newVM();
+  login(vm);
+  connect(vm);
+  vm.run('SlashCmdList.WOWAI("autosay on")');
+  assert.equal(vm.evaluate('WoWAIDB.settings.autoSay'), 'true');
+  const activeBefore = vm.evaluate('WoWAIDB.activeChat');
+
+  vm.run('STUB.FireEvent("CHAT_MSG_SAY", "what is the capital of France?", "Bob")');
+  assert.equal(vm.num('#WoWAIDB.chats'), 2);
+  assert.equal(vm.evaluate('WoWAIDB.chats[2].name'), 'Say');
+  assert.equal(vm.evaluate('WoWAIDB.chats[2].sayChat'), 'true');
+  assert.equal(vm.evaluate('WoWAIDB.activeChat'), activeBefore, 'active chat is not stolen');
+
+  const rec = stripRecords(vm).find(r => r.text === 'Bob: what is the capital of France?');
+  assert.ok(rec, 'the say line is on the strip immediately, with no 10s wait');
+  assert.ok((rec.flags || '').split(';').includes('s'), 'say flag s is set: ' + rec.flags);
+
+  const chatId = vm.evaluate('WoWAIDB.chats[2].id');
+  nextSlot(vm, `{ now = time(), cwd = "", replies = { { chat = "${chatId}", id = ${rec.id}, status = "done", text = "Paris.", sayText = "Paris.", agent = "api" } } }`);
+  vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
+  assert.equal(vm.num('#STUB.whispers'), 1, 'the answer is spoken');
+  assert.equal(vm.evaluate('STUB.whispers[1].msg'), 'Paris.');
+  assert.equal(vm.evaluate('STUB.whispers[1].chatType'), 'SAY');
+  assert.equal(vm.evaluate('WoWAIDB.chats[2].history[1].text'), 'Paris.', 'shown in the Say chat');
+
+  // The same slot must not be spoken twice.
+  vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
+  assert.equal(vm.num('#STUB.whispers'), 1);
+});
+
+test('a dropped say batch (quiet reply) ends the wait without speaking', () => {
+  const vm = newVM();
+  login(vm);
+  connect(vm);
+  vm.run('SlashCmdList.WOWAI("autosay on")');
+  vm.run('STUB.FireEvent("CHAT_MSG_SAY", "anyone got spare gold?", "Bob")');
+  const rec = stripRecords(vm).find(r => r.text === 'Bob: anyone got spare gold?');
+  assert.ok(rec, 'the say line went to the bridge');
+  const chatId = vm.evaluate('WoWAIDB.chats[2].id');
+
+  // The bridge stayed quiet this round: status done, no sayText.
+  nextSlot(vm, `{ now = time(), cwd = "", replies = { { chat = "${chatId}", id = ${rec.id}, status = "done", text = "", agent = "api" } } }`);
+  vm.run('STUB.now = STUB.now + 6; STUB.Tick()');
+  assert.equal(vm.num('#STUB.whispers'), 0, 'a dropped batch is not spoken');
+  assert.equal(vm.num('#WoWAIDB.chats[2].history'), 0, 'a dropped batch adds nothing to the Say chat');
+});
+
+test('say mode ignores bracket text from other addons', () => {
+  const vm = newVM();
+  login(vm);
+  connect(vm);
+  vm.run('SlashCmdList.WOWAI("autosay on")');
+
+  // Addon chatter (links, prefixes, markers) must never reach the strip.
+  vm.run('STUB.FireEvent("CHAT_MSG_SAY", "[Guild] invites open, whisper me", "Bob")');
+  vm.run('STUB.FireEvent("CHAT_MSG_SAY", "loot [Fine Longsword] wts", "Bob")');
+  vm.run('STUB.FireEvent("CHAT_MSG_SAY", "just a plain word ]", "Bob")');
+  assert.equal(stripRecords(vm).length, 0, 'bracketed say lines are not encoded');
+
+  // Plain speech still goes through.
+  vm.run('STUB.FireEvent("CHAT_MSG_SAY", "nice weather today", "Bob")');
+  const recs = stripRecords(vm);
+  assert.equal(recs.length, 1);
+  assert.equal(recs[0].text, 'Bob: nice weather today');
+});
+
+test('say mode labels each line with who said it, so the bridge knows the speaker', () => {
+  const vm = newVM();
+  login(vm);
+  connect(vm);
+  vm.run('SlashCmdList.WOWAI("autosay on")');
+
+  vm.run('STUB.FireEvent("CHAT_MSG_SAY", "where is the trainer?", "Bob")');
+  vm.run('STUB.FireEvent("CHAT_MSG_SAY", "depends on your faction", "Jane")');
+  // A cross-realm name is trimmed to the bare character name.
+  vm.run('STUB.FireEvent("CHAT_MSG_SAY", "ironforge", "Ann-Area52")');
+  // The player's own line is never attributed back to the bridge.
+  vm.run('STUB.FireEvent("CHAT_MSG_SAY", "I am talking too", "Testchar")');
+
+  const texts = stripRecords(vm).map(r => r.text);
+  assert.deepEqual(texts, [
+    'Bob: where is the trainer?',
+    'Jane: depends on your faction',
+    'Ann: ironforge',
+  ]);
+});

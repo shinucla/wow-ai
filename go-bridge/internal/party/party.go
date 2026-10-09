@@ -13,9 +13,9 @@ type Chatter = autochat.Chatter
 type Result = autochat.Result
 
 func SystemPrompt(gameCtx string) string {
-	return protocol.SystemPrompt(gameCtx, "", protocol.CoachParty)
+	return protocol.SystemPrompt(gameCtx, "", protocol.CoachParty, protocol.Style{})
 }
 
 func Decide(ctx context.Context, client Chatter, incoming, gameCtx string, history []llm.Message) (Result, error) {
-	return autochat.Decide(ctx, client, protocol.CoachParty, incoming, gameCtx, history)
+	return autochat.Decide(ctx, client, protocol.CoachParty, incoming, gameCtx, history, protocol.Style{})
 }

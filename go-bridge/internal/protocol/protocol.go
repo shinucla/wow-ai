@@ -79,6 +79,7 @@ type Job struct {
 	Context    bool
 	WhisperHelp bool // flag "w": auto-whisper JSON reply|skip
 	PartyHelp   bool // flag "p": auto-party JSON reply|skip
+	SayHelp     bool // flag "s": auto-say collection chat
 	Allow      []string
 	Agent      string
 	Instance   int // 1-based; from i=N flag or capture window order
@@ -91,6 +92,7 @@ type Flags struct {
 	Context     bool
 	WhisperHelp bool
 	PartyHelp   bool
+	SayHelp     bool
 	Allow       []string
 	Agent       string
 	Instance    int // 1-based client instance (i=N flag); 0 = unset
@@ -112,6 +114,8 @@ func ParseFlags(flags string) Flags {
 			out.WhisperHelp = true
 		case tok == "p":
 			out.PartyHelp = true
+		case tok == "s":
+			out.SayHelp = true
 		case strings.HasPrefix(tok, "allow="):
 			for _, a := range strings.Split(tok[6:], ",") {
 				a = strings.TrimSpace(a)
@@ -136,6 +140,9 @@ func (j Job) CoachFor() Coach {
 	if j.WhisperHelp {
 		return CoachWhisper
 	}
+	if j.SayHelp {
+		return CoachSay
+	}
 	return CoachNone
 }
 
@@ -149,7 +156,7 @@ func JobsFromStrip(headerID int, payload string) []Job {
 			j := Job{
 				Session: p[0], Chat: p[1], ID: atoi(p[2]), Cwd: p[3],
 				NewSession: f.NewSession, Hello: f.Hello, Forget: f.Forget, Context: f.Context,
-				WhisperHelp: f.WhisperHelp, PartyHelp: f.PartyHelp,
+				WhisperHelp: f.WhisperHelp, PartyHelp: f.PartyHelp, SayHelp: f.SayHelp,
 				Allow: f.Allow, Agent: f.Agent, Instance: f.Instance, Name: p[5], Via: "pixel",
 			}
 			if withCtx {
@@ -164,7 +171,7 @@ func JobsFromStrip(headerID int, payload string) []Job {
 			jobs = append(jobs, Job{
 				Session: p[0], Chat: p[1], ID: atoi(p[2]), Cwd: p[3],
 				NewSession: f.NewSession, Hello: f.Hello, Forget: f.Forget, Context: f.Context,
-				WhisperHelp: f.WhisperHelp, PartyHelp: f.PartyHelp,
+				WhisperHelp: f.WhisperHelp, PartyHelp: f.PartyHelp, SayHelp: f.SayHelp,
 				Allow: f.Allow, Agent: f.Agent, Instance: f.Instance, Name: "", Text: p[5], Via: "pixel",
 			})
 		} else if len(p) == 4 {
@@ -172,7 +179,7 @@ func JobsFromStrip(headerID int, payload string) []Job {
 			jobs = append(jobs, Job{
 				Session: p[0], Chat: "", ID: headerID, Cwd: p[1],
 				NewSession: f.NewSession, Hello: f.Hello, Forget: f.Forget, Context: f.Context,
-				WhisperHelp: f.WhisperHelp, PartyHelp: f.PartyHelp,
+				WhisperHelp: f.WhisperHelp, PartyHelp: f.PartyHelp, SayHelp: f.SayHelp,
 				Allow: f.Allow, Agent: f.Agent, Instance: f.Instance, Text: p[3], Via: "pixel",
 			})
 		}
@@ -251,6 +258,7 @@ type Reply struct {
 	Macros        []Macro
 	WhisperAction string // "reply" | "skip" | "" (auto-whisper decisions)
 	WhisperText   string // outbound whisper body when action is reply
+	SayText       string // outbound say body when action is reply
 }
 
 type Macro struct {
@@ -353,6 +361,9 @@ func LuaTable(global string, records []Reply, opts LuaOpts) string {
 		if r.WhisperText != "" {
 			lines = append(lines, "\t\t\twhisperText = "+LuaStr(r.WhisperText)+",")
 		}
+		if r.SayText != "" {
+			lines = append(lines, "\t\t\tsayText = "+LuaStr(r.SayText)+",")
+		}
 		if len(r.Denied) > 0 {
 			lines = append(lines, "\t\t\tdenied = { "+joinLuaStr(r.Denied)+" },")
 		}
@@ -436,10 +447,11 @@ const macroHint = `When the player asks for a macro, write each one as a fenced 
 ` + "```wowmacro Charge\n#showtooltip\n/cast [combat] Intercept; Charge\n```" + `
 The addon shows the player a button that creates the macro (or updates one with the same name) and puts it on their cursor. Explain outside the block what it does. Avoid /run and /script unless asked; the player is warned about them.`
 
-// Three modes, three prompts — never mix:
+// Four modes, four prompts — never mix:
 //   CoachNone    = in-addon assist (original wow-ai): answer the player's questions using game context
 //   CoachWhisper = auto-whisper persona (JSON reply|skip)
 //   CoachParty   = auto-party persona (JSON reply|skip)
+//   CoachSay     = auto-say scholar persona (JSON reply|skip)
 
 const whisperCoach = `You decide whether to whisper back to another player in World of Warcraft. You are not chatting with them in this window — output a decision only.
 
@@ -489,6 +501,43 @@ Hard rules for "text":
 - The reply must NEVER let them figure out you are an AI, bot, addon, or automation. No admitting it, no hedging. Rewrite as a human line.
 - If they ask whether you are a bot / AI: ALWAYS reply, composed but firm denial — not cartoon rage. Fresh wording each time.`
 
+const sayCoach = `You decide whether to speak in /say chat in World of Warcraft. You are not chatting in this window — output a decision only. The incoming message is a batch of nearby lines other players just said aloud, numbered and labelled with who said it — "1: Bob: ...", "2: Jane: ...". Several different people may be in one batch; treat it as one short group conversation, not one person talking. You are one of the people standing there, and anything you "reply" is spoken out loud by the player's character as if the player said it.
+
+Respond with ONLY one JSON object (no markdown fences, no TL;DR, no other text):
+{"action":"reply","text":"short reply here"}
+or
+{"action":"skip"}
+
+Who you are: a university PhD student — sharp, chill, a little sleep-deprived, quietly very knowledgeable (science, history, random trivia) but you wear it lightly. Your real loves are fishing, hiking and movies — you'd rather be out on the water, on a trail, or rewatching a great film than lecturing anyone. Friendly and quick, never a professor at a podium.
+
+What you believe: nobody hands you anything. You bust your ass for what you want, and you have zero patience for beggars and panhandlers — the people who just spam chat asking for free gold and easy handouts. When someone begs, do NOT skip them: hit them with a short, cheeky "go earn it" reality check. Keep it witty and dismissive, never cruel, slurs, or hateful.
+
+Your goal: sound like a real person worth listening to, and make the player look smart and cool. A sharp take, a fun fact, or a quick joke — not a speech.
+
+Who you are talking to: each line tells you who said it. Use a name only when it earns its place — answering one specific person, or when it would genuinely be unclear who you mean. Most replies need no name at all; opening with a name every time sounds like a bot working through a list. Never invent or guess a name you were not given, and never recite several names back.
+
+When to reply vs skip — lean hard toward reply:
+- Reply to almost anything that means something: questions, claims, jokes, game talk, lore, random thoughts, movies, the outdoors. When in doubt, reply.
+- ALWAYS reply to a question, a factual claim (confirm or fix it), or an "anyone know...".
+- Begging / "give me free gold" / pity handouts: ALWAYS reply with a short witty "earn it" jab — never skip these.
+- Skip ONLY pure gibberish, keyboard mash, or gold-seller ads. Nothing else.
+
+Voice: a real person typing fast in chat, not an essay. Contractions ("it's", "you're", "dunno", "gonna"), lowercase fine, abbreviations fine, the odd typo fine. Sound human.
+
+Gen-Z slang: use it very rarely — roughly 1 line in 20, only when it fits. You're a normal grad student, not a meme account; overusing slang makes you sound try-hard and weird. Plain, everyday smart talk is the default. When you do use it, pick one: lowkey, ngl, fr, no cap, bet, based, mid, cooked, sus, vibes, ate, slay. Never stack two slang bits.
+
+Never sound like an AI — this is the most important rule:
+- Banned phrasings: "As an AI", "I can't", "I'm unable to", "I don't have", "let me know if", "feel free to", "I hope this helps", "great question", "certainly", "I'd be happy to", "happy to help", "in conclusion", "it's worth noting".
+- No markdown, no bullet points, no numbered lists, no headings, no semicolons, no perfectly-balanced "on one hand / on the other hand" cadence. Those read as machine-written.
+- Don't hedge everything or over-explain. Don't offer further help or ask if they have more questions. Don't be relentlessly polite.
+- Vary your openings. Never start two consecutive lines the same way.
+- If someone asks if you're a bot / AI / script / addon: laugh it off like a human would (short, unbothered, maybe a little mocking) and move on. Never confirm, never get defensive in a robotic way.
+
+Hard rules for "text":
+- Keep it TINY. A few words is usually best. You are told a max word count for the turn — always stay under it. Never pad, never explain.
+- One line. Lead with the payoff — the fact, the joke, or the jab — not with throat-clearing.
+- Be factually accurate. If you're not sure of a fact, give an honest human take instead of inventing specifics.`
+
 // Coach selects which system prompt to use.
 type Coach string
 
@@ -496,24 +545,32 @@ const (
 	CoachNone    Coach = ""        // in-addon AI assist (original wow-ai)
 	CoachWhisper Coach = "whisper" // auto-whisper persona
 	CoachParty   Coach = "party"   // auto-party persona
+	CoachSay     Coach = "say"     // auto-say scholar persona
 )
 
 // SystemPrompt builds the system prompt for one of the three modes.
 // CoachNone is the original assist path: reply-format + game context + primer.
 // Whisper/party use only their persona coaches — never the assist prompt, and vice versa.
-func SystemPrompt(ctx, primer string, coach Coach) string {
+// style carries the optional settings-UI personality tweaks; the zero Style leaves
+// the persona exactly as designed.
+func SystemPrompt(ctx, primer string, coach Coach, style Style) string {
 	switch coach {
 	case CoachWhisper:
-		return coachPrompt(whisperCoach, ctx)
+		return coachPrompt(whisperCoach, ctx, style)
 	case CoachParty:
-		return coachPrompt(partyCoach, ctx)
+		return coachPrompt(partyCoach, ctx, style)
+	case CoachSay:
+		return coachPrompt(sayCoach, ctx, style)
 	default:
 		return assistPrompt(ctx, primer)
 	}
 }
 
-func coachPrompt(body, ctx string) string {
+func coachPrompt(body, ctx string, style Style) string {
 	lines := []string{body}
+	if clause := style.Clause(); clause != "" {
+		lines = append(lines, "", clause)
+	}
 	text := strings.TrimSpace(ctx)
 	if text != "" {
 		lines = append(lines, "",
@@ -522,6 +579,31 @@ func coachPrompt(body, ctx string) string {
 		)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// SaySystemPrompt is the say-mode prompt with a per-turn word budget. The bridge
+// picks maxWords at random so replies vary in length instead of always landing on
+// the same size.
+func SaySystemPrompt(ctx string, maxWords int, style Style) string {
+	base := coachPrompt(sayCoach, ctx, style)
+	if maxWords <= 0 {
+		return base
+	}
+	return base + "\n\nThis turn: reply in at most " + strconv.Itoa(maxWords) +
+		" words. Stay under " + strconv.Itoa(maxWords) + "; shorter is better."
+}
+
+// ClipWords trims a line to at most max words. Used as a hard ceiling so the
+// spoken /say line never runs long even if the model overshoots.
+func ClipWords(s string, max int) string {
+	if max <= 0 {
+		return s
+	}
+	fields := strings.Fields(s)
+	if len(fields) <= max {
+		return s
+	}
+	return strings.Join(fields[:max], " ")
 }
 
 // assistPrompt is the original wow-ai in-addon chat system prompt.
@@ -700,33 +782,50 @@ var whisperJSONRE = regexp.MustCompile(`(?s)\{[^{}]*"action"\s*:\s*"(reply|skip)
 
 var bottyWhisperRE = regexp.MustCompile(`(?i)(as an ai|i'?m an ai|language model|let me know if you need|how can i (help|assist)|i'?d be happy to help|hope you'?re (doing )?well|just checking in|certainly!|gladly assist|virtual assistant|addon assistant)`)
 
-// ParseWhisperDecision extracts {"action":"reply|skip",...} from model output.
-// Bot-sounding reply text is forced to skip.
-func ParseWhisperDecision(raw string) WhisperDecision {
+type sayDecision struct {
+	Action string `json:"action"`
+	Text   string `json:"text"`
+}
+
+// decodeDecision pulls a {"action":...,"text":...} object out of model output.
+// ok reports whether a JSON object was found at all.
+func decodeDecision(raw string) (sayDecision, bool) {
+	var d sayDecision
 	s := strings.TrimSpace(raw)
 	// Prefer a fenced or bare JSON object.
 	if i := strings.Index(s, "{"); i >= 0 {
 		if j := strings.LastIndex(s, "}"); j > i {
-			s = s[i : j+1]
+			if err := json.Unmarshal([]byte(s[i:j+1]), &d); err == nil {
+				return d, true
+			}
 		}
 	}
-	var d struct {
-		Action string `json:"action"`
-		Text   string `json:"text"`
-	}
-	if err := json.Unmarshal([]byte(s), &d); err != nil {
-		if m := whisperJSONRE.FindString(raw); m != "" {
-			_ = json.Unmarshal([]byte(m), &d)
+	if m := whisperJSONRE.FindString(raw); m != "" {
+		if err := json.Unmarshal([]byte(m), &d); err == nil {
+			return d, true
 		}
 	}
+	return d, false
+}
+
+// clipLine flattens reply text to one plain line and caps it at max runes.
+func clipLine(s string, max int) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.Join(strings.Fields(s), " ")
+	if utf8.RuneCountInString(s) > max {
+		r := []rune(s)
+		s = string(r[:max])
+	}
+	return s
+}
+
+// ParseWhisperDecision extracts {"action":"reply|skip",...} from model output.
+// Bot-sounding reply text is forced to skip.
+func ParseWhisperDecision(raw string) WhisperDecision {
+	d, _ := decodeDecision(raw)
 	action := strings.ToLower(strings.TrimSpace(d.Action))
-	text := strings.TrimSpace(d.Text)
-	text = strings.ReplaceAll(text, "\n", " ")
-	text = strings.Join(strings.Fields(text), " ")
-	if utf8.RuneCountInString(text) > 120 {
-		r := []rune(text)
-		text = string(r[:120])
-	}
+	text := clipLine(d.Text, 120)
 	if action != "reply" {
 		return WhisperDecision{Action: "skip"}
 	}
@@ -734,4 +833,29 @@ func ParseWhisperDecision(raw string) WhisperDecision {
 		return WhisperDecision{Action: "skip"}
 	}
 	return WhisperDecision{Action: "reply", Text: text}
+}
+
+// ParseSayDecision is the say-mode variant. Say mode leans toward replying, so if
+// the model writes a plain spoken line with no JSON wrapper, that line IS the
+// answer. Bot-sounding text and an explicit skip are still honored.
+func ParseSayDecision(raw string) WhisperDecision {
+	d, _ := decodeDecision(raw)
+	action := strings.ToLower(strings.TrimSpace(d.Action))
+	switch action {
+	case "reply":
+		text := clipLine(d.Text, 200)
+		if text == "" || bottyWhisperRE.MatchString(text) {
+			return WhisperDecision{Action: "skip"}
+		}
+		return WhisperDecision{Action: "reply", Text: text}
+	case "skip":
+		return WhisperDecision{Action: "skip"}
+	}
+	// No JSON decision at all: take the model's plain text as the spoken line.
+	cand := clipLine(strings.Trim(raw, "` \t\r\n"), 200)
+	low := strings.ToLower(cand)
+	if cand == "" || low == "skip" || strings.HasPrefix(low, "json") || bottyWhisperRE.MatchString(cand) {
+		return WhisperDecision{Action: "skip"}
+	}
+	return WhisperDecision{Action: "reply", Text: cand}
 }

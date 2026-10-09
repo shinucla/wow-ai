@@ -71,7 +71,11 @@ func (c *Client) chatOpenAI(ctx context.Context, system, user string, history []
 	}
 	base := strings.TrimRight(c.cfg.BaseURL, "/")
 	if base == "" {
-		base = "https://api.openai.com/v1"
+		if strings.EqualFold(c.cfg.Provider, "deepseek") {
+			base = "https://api.deepseek.com/v1"
+		} else {
+			base = "https://api.openai.com/v1"
+		}
 	}
 	return c.postJSON(ctx, base+"/chat/completions", map[string]string{
 		"Authorization": "Bearer " + c.cfg.APIKey,

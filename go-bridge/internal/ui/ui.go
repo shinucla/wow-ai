@@ -17,6 +17,7 @@ import (
 	"github.com/chelinho139/wow-ai/go-bridge/internal/bridge"
 	"github.com/chelinho139/wow-ai/go-bridge/internal/capture"
 	"github.com/chelinho139/wow-ai/go-bridge/internal/config"
+	"github.com/chelinho139/wow-ai/go-bridge/internal/protocol"
 	"github.com/chelinho139/wow-ai/go-bridge/internal/publish"
 )
 
@@ -102,6 +103,7 @@ func (a *App) Run(ctx context.Context) error {
 	mux.HandleFunc("/api/install-slots", a.handleInstallSlots)
 	mux.HandleFunc("/api/inject", a.handleInject)
 	mux.HandleFunc("/api/probe", a.handleProbe)
+	mux.HandleFunc("/api/style-options", a.handleStyleOptions)
 
 	srv := &http.Server{Handler: mux}
 	go func() {
@@ -227,6 +229,24 @@ func (a *App) handleInject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]interface{}{"ok": "injected", "id": id, "instance": inst})
+}
+
+// handleStyleOptions serves the personality/education/characteristics catalogs
+// straight from the protocol package, so the UI dropdowns and the prompt builder
+// can never disagree about what a key means.
+func (a *App) handleStyleOptions(w http.ResponseWriter, r *http.Request) {
+	toJSON := func(list []protocol.StyleOption) []map[string]string {
+		out := make([]map[string]string, 0, len(list))
+		for _, o := range list {
+			out = append(out, map[string]string{"key": o.Key, "label": o.Label})
+		}
+		return out
+	}
+	writeJSON(w, map[string]interface{}{
+		"personalities":   toJSON(protocol.Personalities),
+		"education":       toJSON(protocol.EducationLevels),
+		"characteristics": toJSON(protocol.Characteristics),
+	})
 }
 
 func (a *App) handleProbe(w http.ResponseWriter, r *http.Request) {

@@ -2,7 +2,7 @@
 ## Title: WoW AI
 ## Notes: Talk to a local coding agent / LLM bridge from inside WoW 3.3.5a. Needs the companion bridge (see go-bridge/).
 ## Author: chelinho139
-## Version: 0.4.0-335a
+## Version: 0.4.2-335a
 ## SavedVariables: WoWAIDB, WoWAIMapDB
 
 Compat.lua

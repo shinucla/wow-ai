@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,11 +41,17 @@ type Engine struct {
 	handled map[string]map[int]bool // session → ids
 	history map[string][]llm.Message
 	context map[int]string // per-instance game context
+	sayBuf  map[int][]string  // per-instance /say lines waiting for the flush
+	sayChat map[int]string    // per-instance addon chat id the say lines came from
+	sayID   map[int]int       // per-instance id of the newest collected say record
 	running bool
 	cancel  context.CancelFunc
 	sem     chan struct{}
 	injectN int
 }
+
+// sayBufMax caps collected lines per instance so a chatty zone can't grow it forever.
+const sayBufMax = 60
 
 func New(cfg config.Config, cfgPath string, log LogFunc) *Engine {
 	if log == nil {
@@ -66,6 +73,9 @@ func New(cfg config.Config, cfgPath string, log LogFunc) *Engine {
 		handled: map[string]map[int]bool{},
 		history: map[string][]llm.Message{},
 		context: map[int]string{},
+		sayBuf:  map[int][]string{},
+		sayChat: map[int]string{},
+		sayID:   map[int]int{},
 		sem:     make(chan struct{}, max(1, cfg.MaxParallel)),
 	}
 	e.ensureLanes()
@@ -183,6 +193,7 @@ func (e *Engine) Start() error {
 
 	go e.presenceLoop(ctx)
 	go e.outboxPoll(ctx)
+	go e.sayLoop(ctx)
 
 	go func() {
 		for {
@@ -415,8 +426,168 @@ func (e *Engine) dispatch(ctx context.Context, j protocol.Job) {
 		e.mu.Unlock()
 	}
 
+	// Say mode: don't answer each line. Collect it and let sayLoop hand the batch
+	// to the LLM once the configured window elapses. Ack already happened above,
+	// so the strip clears.
+	if j.CoachFor() == protocol.CoachSay {
+		e.mu.Lock()
+		if len(e.sayBuf[j.Instance]) < sayBufMax {
+			e.sayBuf[j.Instance] = append(e.sayBuf[j.Instance], j.Text)
+		}
+		e.sayChat[j.Instance] = j.Chat
+		e.sayID[j.Instance] = j.ID
+		e.mu.Unlock()
+		e.logGame("say", "from", j.Text)
+		return
+	}
+
 	e.logGame(jobChannel(j), "from", j.Text)
 	go e.runJob(ctx, j)
+}
+
+// configSnapshot returns a copy of the current config under the lock, for
+// goroutines that need a setting without holding e.mu for long.
+func (e *Engine) configSnapshot() config.Config {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.Cfg
+}
+
+// sayLoop flushes collected /say lines to the LLM on the configured cadence.
+// The interval is re-read after every flush, so a settings change takes effect
+// from the next round without a restart.
+func (e *Engine) sayLoop(ctx context.Context) {
+	for {
+		t := time.NewTimer(time.Duration(e.configSnapshot().SayCollectSeconds()) * time.Second)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+			e.flushSay(ctx)
+		}
+	}
+}
+
+// flushSay takes whatever /say lines have collected, one batch per instance. The
+// buffer is cleared first so new lines collect while a reply is being written.
+// Each batch is only answered SayReplyChance percent of the time; otherwise it is
+// dropped, so the character speaks up now and then instead of constantly.
+func (e *Engine) flushSay(ctx context.Context) {
+	e.mu.Lock()
+	if len(e.sayBuf) == 0 {
+		e.mu.Unlock()
+		return
+	}
+	batches := make(map[int][]string, len(e.sayBuf))
+	for inst, lines := range e.sayBuf {
+		if len(lines) > 0 {
+			batches[inst] = lines
+		}
+	}
+	e.sayBuf = map[int][]string{}
+	e.mu.Unlock()
+
+	cfg := e.configSnapshot()
+	for inst, lines := range batches {
+		if !cfg.ModeEnabled("say") {
+			e.debug(fmt.Sprintf("say i%d: %d line(s) collected, say mode is off — cleared", inst, len(lines)))
+			e.dropSay(inst)
+			continue
+		}
+		if rand.Intn(100) >= cfg.SayReplyChancePct() {
+			e.debug(fmt.Sprintf("say i%d: %d line(s) collected, rolled not-to-reply — cleared", inst, len(lines)))
+			e.dropSay(inst)
+			continue
+		}
+		go e.runSay(ctx, inst, lines)
+	}
+}
+
+// dropSay clears the addon's wait for this batch without speaking anything, so it
+// stops polling for an answer that will never come.
+func (e *Engine) dropSay(inst int) {
+	e.mu.Lock()
+	replyID := e.sayID[inst]
+	chatID := e.sayChat[inst]
+	e.mu.Unlock()
+	if replyID == 0 {
+		return
+	}
+	ln := e.lane(inst)
+	ln.pub.Publish(fmt.Sprintf("say:%d", inst), protocol.Reply{
+		Chat: chatID, ID: replyID, Status: "done", Text: "",
+		Cwd: e.Cfg.DefaultCwd, Agent: e.LLM.AgentName(), Instance: inst,
+	}, true)
+	_ = ln.sig.Sig(replyID)
+}
+
+// runSay asks the scholar persona about one batch of surrounding /say lines and
+// publishes the answer for the addon to speak in /s.
+func (e *Engine) runSay(ctx context.Context, inst int, lines []string) {
+	select {
+	case e.sem <- struct{}{}:
+		defer func() { <-e.sem }()
+	case <-ctx.Done():
+		return
+	}
+
+	ln := e.lane(inst)
+	var b strings.Builder
+	for i, l := range lines {
+		fmt.Fprintf(&b, "%d: %s\n", i+1, l)
+	}
+	prompt := strings.TrimRight(b.String(), "\n")
+
+	e.mu.Lock()
+	gameCtx := e.context[inst]
+	key := fmt.Sprintf("say:%d", inst)
+	replyID := e.sayID[inst]
+	chatID := e.sayChat[inst]
+	hist := append([]llm.Message(nil), e.history[key]...)
+	e.mu.Unlock()
+
+	// Random word budget each turn (min..max from settings) so replies vary
+	// instead of all matching.
+	sayCfg := e.configSnapshot()
+	lo, hi := sayCfg.SayWordRange()
+	maxWords := lo + rand.Intn(hi-lo+1)
+	res, err := autochat.DecideSay(ctx, e.LLM, prompt, gameCtx, hist, maxWords, styleFor(sayCfg, "say"))
+	if err != nil {
+		e.Log(fmt.Sprintf("say error i%d: %v", inst, err))
+		return
+	}
+	// Show what actually came back, so a "why did it skip?" is answerable from the log.
+	e.debug(fmt.Sprintf("say i%d: %d line(s), maxWords=%d, style=%s, raw reply: %s",
+		inst, len(lines), maxWords, describeStyle(sayCfg, "say"), truncateDebug(res.Raw, 300)))
+	if res.Decision.Action != "reply" || strings.TrimSpace(res.Decision.Text) == "" {
+		e.logGame("say", "to", "(skip)")
+		return
+	}
+	text := res.Decision.Text
+	e.logGame("say", "to", text)
+
+	e.mu.Lock()
+	e.history[key] = append(e.history[key],
+		llm.Message{Role: "user", Content: prompt},
+		llm.Message{Role: "assistant", Content: text},
+	)
+	if len(e.history[key]) > 40 {
+		e.history[key] = e.history[key][len(e.history[key])-40:]
+	}
+	e.mu.Unlock()
+
+	// Reply id = the newest collected say record, which the addon already knows,
+	// so its signal check pulls this answer immediately. Fall back to the clock.
+	if replyID == 0 {
+		replyID = int(time.Now().Unix())
+	}
+	ln.pub.Publish(key, protocol.Reply{
+		Chat: chatID, ID: replyID, Status: "done", Text: text,
+		Cwd: e.Cfg.DefaultCwd, Agent: e.LLM.AgentName(), Instance: inst,
+		SayText: text,
+	}, true)
+	ln.sig.Sig(replyID)
 }
 
 func (e *Engine) runJob(ctx context.Context, j protocol.Job) {
@@ -449,23 +620,43 @@ func (e *Engine) runJob(ctx context.Context, j protocol.Job) {
 	hist := append([]llm.Message(nil), e.history[key]...)
 	e.mu.Unlock()
 
+	// Bridge-side master switch for the persona modes. With the mode off we do
+	// not call the LLM; we answer "skip" so the addon stops waiting on this id.
+	if (coach == protocol.CoachWhisper || coach == protocol.CoachParty) && !e.configSnapshot().ModeEnabled(jobChannel(j)) {
+		channel := jobChannel(j)
+		e.debug(fmt.Sprintf("#%d [%s] auto-reply is off in bridge settings — skipped", j.ID, channel))
+		ln.pub.Publish(key, protocol.Reply{
+			Chat: j.Chat, ID: j.ID, Status: "done", Text: "(auto-reply off)",
+			Cwd: cwd, Agent: agent, Instance: j.Instance, WhisperAction: "skip",
+		}, true)
+		ln.sig.Sig(j.ID)
+		return
+	}
+
 	var text string
 	var whisperAction, whisperText string
 	var err error
 	switch coach {
+	case protocol.CoachSay:
+		// Say mode is owned by the collector (dispatch + sayLoop). A single say line
+		// must never be answered here; reaching this point means a bug upstream.
+		e.debug(fmt.Sprintf("#%d [say] single say line reached runJob — ignored (collector owns say mode)", j.ID))
+		return
 	case protocol.CoachWhisper, protocol.CoachParty:
-		// Auto-whisper / auto-party only — persona JSON coaches.
-		e.debug(fmt.Sprintf("#%d [%s] persona coach (not assist)", j.ID, jobChannel(j)))
+		// Auto-whisper / auto-party — persona JSON coaches.
+		mode := jobChannel(j)
+		modeCfg := e.configSnapshot()
+		e.debug(fmt.Sprintf("#%d [%s] persona coach (not assist), style=%s", j.ID, mode, describeStyle(modeCfg, mode)))
 		var res autochat.Result
-		res, err = autochat.Decide(ctx, e.LLM, coach, j.Text, gameCtx, hist)
+		res, err = autochat.Decide(ctx, e.LLM, coach, j.Text, gameCtx, hist, styleFor(modeCfg, mode))
 		if err == nil {
 			text = res.Text
 			whisperAction = res.Decision.Action
 			whisperText = res.Decision.Text
 			if res.Decision.Action == "reply" {
-				e.logGame(jobChannel(j), "to", res.Decision.Text)
+				e.logGame(mode, "to", res.Decision.Text)
 			} else {
-				e.logGame(jobChannel(j), "to", "(skip)")
+				e.logGame(mode, "to", "(skip)")
 			}
 		}
 	default:
@@ -480,7 +671,7 @@ func (e *Engine) runJob(ctx context.Context, j protocol.Job) {
 		} else {
 			e.debug(fmt.Sprintf("#%d [%s] context %d bytes", j.ID, mode, len(gameCtx)))
 		}
-		sys := protocol.SystemPrompt(gameCtx, e.Primer, protocol.CoachNone)
+		sys := protocol.SystemPrompt(gameCtx, e.Primer, protocol.CoachNone, protocol.Style{})
 		text, err = e.LLM.Chat(ctx, sys, j.Text, hist)
 	}
 	if err != nil {
@@ -530,9 +721,37 @@ func jobChannel(j protocol.Job) string {
 		return "whisper"
 	case protocol.CoachParty:
 		return "party"
+	case protocol.CoachSay:
+		return "say"
 	default:
 		return "chat"
 	}
+}
+
+// styleFor turns the settings-UI dropdowns for a mode into a protocol.Style.
+func styleFor(cfg config.Config, mode string) protocol.Style {
+	personality, education, characteristics := cfg.ModeStyle(mode)
+	return protocol.Style{
+		Personality:     personality,
+		Education:       education,
+		Characteristics: characteristics,
+	}
+}
+
+// describeStyle is a compact "personality/education/characteristics" string for
+// the debug log, so "why did it talk like that?" is answerable from the log.
+func describeStyle(cfg config.Config, mode string) string {
+	s := styleFor(cfg, mode)
+	if s.IsZero() {
+		return "default"
+	}
+	part := func(label, key string) string {
+		if key == "" {
+			return label + "=default"
+		}
+		return label + "=" + key
+	}
+	return part("p", s.Personality) + " " + part("e", s.Education) + " " + part("c", s.Characteristics)
 }
 
 // logGame writes one UI line: [HH:MM:SS] [chat|whisper|party] [from|to] game: <raw>

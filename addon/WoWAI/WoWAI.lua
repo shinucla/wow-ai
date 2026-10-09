@@ -200,6 +200,7 @@ local function InitDB()
 	-- Opt-in auto-reply toggles (bridge returns JSON reply|skip; nothing sent on skip).
 	if s.autoWhisper == nil then s.autoWhisper = false end
 	if s.autoParty == nil then s.autoParty = false end
+	if s.autoSay == nil then s.autoSay = false end
 	-- How much of each reply to print in the game chat. "summary" (the agent's
 	-- closing TL;DR lines) replaced "full" as the default; an install that still
 	-- has the old default saved moves over once, any other choice is kept.
@@ -772,7 +773,23 @@ local function ApplyReplies(replies)
 			-- skip other instance
 		else
 			local c = FindChat(r.chat)
-			if c and c.pendingId and r.id == c.pendingId then
+			if c and c.sayChat and r.status == "done" then
+				-- Say mode: the bridge answers only a fraction of collected batches.
+				-- An empty sayText means it chose to stay quiet this round; either way
+				-- the wait for this batch is over. Speak each new answer only once.
+				if run.sayWaitId == r.id then run.sayWaitId = nil end
+				if r.sayText and r.sayText ~= "" and r.id ~= c.lastSayId then
+					matched = true
+					c.lastSayId = r.id
+					WoWAI.DeliverSay(r.sayText)
+					AddHistory(c, "assistant", r.sayText, r.id, nil, r.agent)
+					if db.activeChat ~= c.id then
+						c.unread = (c.unread or 0) + 1
+						WoWAI.UpdateMini()
+					end
+					WoWAI.RenderChatList()
+				end
+			elseif c and c.pendingId and r.id == c.pendingId then
 				matched = true
 				MarkAcked(r.id)
 				local denied = type(r.denied) == "table" and #r.denied > 0 and r.denied or nil
@@ -956,7 +973,8 @@ local function Tick()
 		RefreshStrip()
 		WoWAI.UpdateStatus()
 	end
-	if not AnyPending() then return end
+	local hasSay = run.sayWaitId ~= nil
+	if not AnyPending() and not hasSay then return end
 	local moved = false
 	for _, c in ipairs(db.chats) do
 		if c.pendingId and PollActivity(c) then moved = true end
@@ -967,6 +985,10 @@ local function Tick()
 			TryLoadSlot("signal")
 			return
 		end
+	end
+	if hasSay and CheckSignal("sig", run.sayWaitId) then
+		TryLoadSlot("signal")
+		return
 	end
 	if run.nextPollAt and now >= run.nextPollAt then
 		TryLoadSlot("schedule")
@@ -1227,7 +1249,7 @@ end
 -- The context to put on the next record, or nil when the bridge already has
 -- it (or it wouldn't fit next to this message; it goes with a later one).
 -- "" when the setting is off, so the bridge drops what it had.
--- Assist sends (not auto-whisper/party coaches) always include a fresh snapshot
+-- Assist sends (not auto-whisper/party/say coaches) always include a fresh snapshot
 -- so questions like "where am I?" still work after a bridge restart.
 local function ContextToSend(room, autoCoach)
 	local ctx = db.settings.context and WoWAI.GameContext() or ""
@@ -1344,7 +1366,7 @@ function WoWAI.Send(text, allow, targetChat)
 		WoWAI.Render()
 		return
 	end
-	-- Persona coaches only for auto-whisper / auto-party (those set replyWhisper /
+	-- Persona coaches only for auto-whisper / auto-party / auto-say (those set replyWhisper /
 	-- replyParty before Send). Typing in the addon is always assist — even on a
 	-- W:/Party tab — so "where am I?" never hits the dismissive whisper voice.
 	local autoCoach = (c.replyWhisper ~= nil) or (c.replyParty ~= nil)
@@ -1361,6 +1383,7 @@ function WoWAI.Send(text, allow, targetChat)
 	if c.replyWhisper then table.insert(tokens, "w") end
 	-- Auto-party: flag "p".
 	if c.replyParty then table.insert(tokens, "p") end
+	-- Auto-say is its own path (SendSay), so it never rides on this record.
 	local allowHex
 	if type(allow) == "table" and #allow > 0 then
 		table.insert(tokens, "allow=" .. table.concat(allow, ","))
@@ -1429,6 +1452,12 @@ local function SamePlayer(sender)
 	if sender == me then return true end
 	local bare = sender:match("^([^%-]+)")
 	return bare == me
+end
+
+-- "Bob-Area52" -> "Bob". Used to label group chat so the bridge knows who is talking.
+local function BareName(sender)
+	if not sender or sender == "" then return "?" end
+	return sender:match("^([^%-]+)") or sender
 end
 
 local function FindWhisperChat(sender)
@@ -1555,8 +1584,7 @@ function WoWAI.HandleAutoParty(sender, text)
 	local c = EnsurePartyChat()
 	if not c then return end
 
-	local bare = sender and sender:match("^([^%-]+)") or sender or "?"
-	local line = bare .. ": " .. text
+	local line = BareName(sender) .. ": " .. text
 
 	if c.pendingId or (run.sendOnConnect and run.sendOnConnect.chat == c.id) then
 		run.partyQueue = run.partyQueue or {}
@@ -1581,6 +1609,76 @@ function WoWAI.OnIncomingParty(sender, text)
 	if not db or not db.settings.autoParty then return end
 	WoWAI.HandleAutoParty(sender, text)
 end
+
+---------------------------------------------------------------------------
+-- Say mode (opt-in via settings.autoSay)
+-- Every nearby /say line goes onto the strip the moment it is heard (flag "s").
+-- The bridge collects those lines and answers in a batch; the reply is spoken
+-- back in /s. Nothing is buffered here: the bridge decides when to answer.
+---------------------------------------------------------------------------
+
+local SAY_OUT_MAX = 40 -- cap unacknowledged say records on the strip
+
+local function EnsureSayChat()
+	for _, c in ipairs(db.chats) do
+		if c.sayChat then return c end
+	end
+	for _, c in ipairs(db.chats) do
+		if c.name == "Say" then
+			c.sayChat = true
+			return c
+		end
+	end
+	local c = AddChat("Say")
+	if c then c.sayChat = true end
+	return c
+end
+
+-- One heard /say line, straight onto the strip. No batching happens in the addon.
+function WoWAI.SendSay(line)
+	if not db or not db.settings.autoSay then return end
+	if db.settings.mode ~= "pixel" then return end
+	line = Wire(Trim(line or ""))
+	if line == "" then return end
+	if #line > Codec.MAX_PAYLOAD - 300 then return end
+	local pending = 0
+	for _ in pairs(run.outbound) do pending = pending + 1 end
+	if pending >= SAY_OUT_MAX then return end
+	local c = EnsureSayChat()
+	if not c then return end
+	db.lastSeq = db.lastSeq + 1
+	local id = db.lastSeq
+	run.outbound[id] = { chat = c.id, cwd = c.cwd, flags = "s", name = c.name, text = line, sentAt = GetTime() }
+	run.sentAt = GetTime()
+	run.polls = 0
+	-- Remember the newest say record so a signal for it can pull the reply early.
+	run.sayWaitId = id
+	ScheduleNextPoll()
+	RefreshStrip()
+end
+
+function WoWAI.OnIncomingSay(sender, text)
+	run.lastMessenger = "player"
+	if not db or not db.settings.autoSay then return end
+	text = Trim(text or "")
+	if text == "" or SamePlayer(sender) then return end
+	-- Bracket text is addon noise (links, prefixes, markers), not real speech.
+	if text:find("[", 1, true) or text:find("]", 1, true) then return end
+	-- Carry who said it, the same way party mode does, so the bridge and the
+	-- model can tell one speaker's lines from another's in a batch.
+	WoWAI.SendSay(BareName(sender) .. ": " .. text)
+end
+
+-- Speak the bridge's answer in /s.
+function WoWAI.DeliverSay(body)
+	body = Trim(body or "")
+	if body == "" then return end
+	if #body > 250 then body = body:sub(1, 247) .. "..." end
+	if type(SendChatMessage) == "function" then
+		pcall(SendChatMessage, body, "SAY")
+	end
+end
+
 
 -- Forget: a record with no text telling the bridge a chat was deleted, so it drops
 -- the transcript (which a later restore would otherwise bring back) and the
@@ -3014,6 +3112,17 @@ local function BuildUI()
 	autoParty:SetPoint("LEFT", autoWhisper, "RIGHT", 100, 0)
 	ui.autoParty = autoParty
 
+	local autoSay = MakeCheck(f, "Auto-say", s.autoSay,
+		"Every nearby /say line goes to the bridge as you hear it. The bridge collects them for 10 seconds, then sometimes replies in /s.",
+		function(on)
+			s.autoSay = on
+			if not on then
+				run.sayWaitId = nil
+			end
+		end)
+	autoSay:SetPoint("LEFT", autoParty, "RIGHT", 90, 0)
+	ui.autoSay = autoSay
+
 	-- A named, always-present button so a keybinding can click it (see /wow-ai bind).
 	local hotkey = CreateFrame("Button", "WoWAIRefreshButton", UIParent)
 	hotkey:SetSize(1, 1)
@@ -3196,6 +3305,7 @@ local HELP = table.concat({
 	"/wow-ai auto on|off            reload-mode only: auto-reload on your next keypress after the interval",
 	"/wow-ai autowhisper on|off     AI decides reply/skip and may whisper for you (also a checkbox)",
 	"/wow-ai autoparty on|off       AI decides reply/skip in party chat only (also a checkbox)",
+	"/wow-ai autosay on|off         nearby /say lines go to the bridge live; it answers as a scholar in /s (also a checkbox)",
 	"/wow-ai signal on|off          the cheap sound-file readiness check (off if it spams errors)",
 	"/wow-ai slots                  how many reply slots are still free this session",
 	"/wow-ai diag                   transport diagnostics (is the cheap sound-file channel working?)",
@@ -3226,6 +3336,7 @@ local COMMAND_ARGS = {
 	signal = { [""] = true, on = true, off = true }, longchat = { [""] = true, on = true, off = true },
 	autowhisper = { [""] = true, on = true, off = true },
 	autoparty = { [""] = true, on = true, off = true },
+	autosay = { [""] = true, on = true, off = true },
 	auto = OnOffOrNumber,
 	echo = function(rest) return rest == "" or rest == "summary" or rest == "full" or rest == "short" or rest == "off" or tonumber(rest) ~= nil end,
 	bind = 1, agent = 1,
@@ -3388,6 +3499,19 @@ SlashCmdList["WOWAI"] = function(msg)
 		AddHistory(c, "system", "auto-party is " .. (s.autoParty and "ON" or "OFF")
 			.. (s.autoParty and ": party chat goes to the AI (not raid/BG); it may speak in /p" or ""))
 		WoWAI.Render()
+	elseif cmd == "autosay" then
+		if rest == "on" then s.autoSay = true
+		elseif rest == "off" then s.autoSay = false
+		end
+		if ui.autoSay and ui.autoSay.SetChecked then
+			ui.autoSay:SetChecked(s.autoSay and true or false)
+		end
+		if not s.autoSay then
+			run.sayWaitId = nil
+		end
+		AddHistory(c, "system", "auto-say is " .. (s.autoSay and "ON" or "OFF")
+			.. (s.autoSay and ": nearby /say lines go to the bridge as you hear them; it answers as a scholar in /s" or ""))
+		WoWAI.Render()
 	elseif cmd == "hide" or cmd == "quit" then
 		WoWAI.Toggle(false)
 	elseif cmd == "macro" and rest == "undo" then
@@ -3492,6 +3616,7 @@ ev:RegisterEvent("CHAT_MSG_WHISPER")
 ev:RegisterEvent("CHAT_MSG_BN_WHISPER")
 ev:RegisterEvent("CHAT_MSG_PARTY")
 ev:RegisterEvent("CHAT_MSG_PARTY_LEADER")
+ev:RegisterEvent("CHAT_MSG_SAY")
 ev:RegisterEvent("DISPLAY_SIZE_CHANGED")
 ev:SetScript("OnEvent", function(self, event, ...)
 	if event == "ADDON_LOADED" then
@@ -3512,6 +3637,9 @@ ev:SetScript("OnEvent", function(self, event, ...)
 	elseif event == "CHAT_MSG_PARTY" or event == "CHAT_MSG_PARTY_LEADER" then
 		local msg, sender = ...
 		WoWAI.OnIncomingParty(sender, msg)
+	elseif event == "CHAT_MSG_SAY" then
+		local msg, sender = ...
+		WoWAI.OnIncomingSay(sender, msg)
 	elseif event == "PLAYER_LOGIN" then
 		if not db then InitDB() end
 		BuildUI()
