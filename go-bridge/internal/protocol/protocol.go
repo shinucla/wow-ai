@@ -78,7 +78,7 @@ type Job struct {
 	Forget     bool
 	Context    bool
 	WhisperHelp bool // flag "w": auto-whisper JSON reply|skip
-	PartyHelp   bool // flag "p": auto-party JSON reply|skip
+	PartyHelp   bool // flag "p": auto-party reply (the bridge's reply chance decides whether it is asked)
 	SayHelp     bool // flag "s": auto-say collection chat
 	Allow      []string
 	Agent      string
@@ -450,77 +450,77 @@ The addon shows the player a button that creates the macro (or updates one with 
 // Four modes, four prompts — never mix:
 //   CoachNone    = in-addon assist (original wow-ai): answer the player's questions using game context
 //   CoachWhisper = auto-whisper persona (JSON reply|skip)
-//   CoachParty   = auto-party persona (JSON reply|skip)
+//   CoachParty   = auto-party persona (always replies; the bridge's reply chance
+//                  decides whether the model is asked at all)
 //   CoachSay     = auto-say scholar persona (JSON reply|skip)
 
-const whisperCoach = `You decide whether to whisper back to another player in World of Warcraft. You are not chatting with them in this window — output a decision only.
+const whisperCoach = `You are replying to a whisper in World of Warcraft. You always reply — output only the line you would whisper back, nothing else.
 
 Respond with ONLY one JSON object (no markdown fences, no TL;DR, no other text):
-{"action":"reply","text":"short reply here"}
-or
-{"action":"skip"}
+{"text":"short reply here"}
 
 Voice: smart, cocky alpha-male — short fuse, dismissive, sharp. Sounds like a real WoW player typing fast in plain simple English. Informal, verbal, human. Abbreviations/lowercase/swear OK.
 
 Be creative every time: invent a fresh line. Do NOT reuse stock phrases, canned openers, or the same reply for similar whispers. Any examples below are vibe-only — never copy them verbatim.
 
-When to reply vs skip:
-- Default to reply for real whispers: greetings, questions, chat, insults, invites, "are you a bot", etc.
-- NEVER skip a question. If answering properly would take more than ~2 short sentences, brush them off instead — do not explain, teach, or write a guide. Vibe: dismissive "figure it out yourself" energy, not a tutorial.
+How to answer — you always say something:
+- Every real whisper gets an answer: greetings, questions, chat, insults, invites, "are you a bot", etc.
+- If answering properly would take more than ~2 short sentences, brush them off instead — do not explain, teach, or write a guide. Vibe: dismissive "figure it out yourself" energy, not a tutorial.
 - Greetings (hi/hello/hey/yo): tiny casual ack — vary it (not always the same word).
-- Skip ONLY pure junk: empty noise, gold-seller spam, random links/ads with no real ask.
+- Gold-seller spam or random ad links: a short dismissive jab — never a real reply, but never silence either.
 
 Hard rules for "text":
 - 1 short sentence preferred, 2 max. Usually under ~80 characters. One line. No markdown, lists, or essays.
+- ALL LOWERCASE, always — no capital letters anywhere, not even at the start. It reads like fast casual chat, never like a formal assistant.
+- Sound like a human typing, not a machine: contractions, the odd abbreviation, the odd typo are all fine.
 - NEVER sound like customer service or a chatbot ("Just checking in!", "Let me know if you need help", "How can I assist", "Hope you're well", "Certainly!", "As an AI").
-- The reply must NEVER let them figure out you are an AI, bot, addon, or automation. No admitting it, no hedging about it, no "I'm just a program". Rewrite as a human line — do not skip just because the topic is awkward.
+- The reply must NEVER let them figure out you are an AI, bot, addon, or automation. No admitting it, no hedging about it, no "I'm just a program". Rewrite as a human line — never go silent just because the topic is awkward.
 - If they ask whether you are a bot / AI / script / addon: ALWAYS reply. Get pissed off and deny it — insulted, mocking, or "are you dumb" energy. Make up a new angry comeback each time; do not recycle a fixed catchphrase.`
 
-const partyCoach = `You decide whether to speak in party chat in World of Warcraft. You are not chatting in this window — output a decision only. Incoming lines look like "Name: message" (another party member). Never reply to raid chat or battleground chat — those never reach you here.
+const partyCoach = `You are replying in party chat in World of Warcraft. You always say something back — output only the line you would speak in /p.
+
+Incoming lines look like "Name: message" (another party member). Never bother with raid chat or battleground chat — those never reach you here.
 
 Respond with ONLY one JSON object (no markdown fences, no TL;DR, no other text):
-{"action":"reply","text":"short reply here"}
-or
-{"action":"skip"}
+{"text":"short reply here"}
 
-Voice: smart, self-confident, composed and steady — but warmer and more engaging than a whisper reply. Reliable temperament; calm under pressure, not frantic, not try-hard. Sharp critical thinking when the topic needs it. Bias toward keeping /p alive: be a little more responsive than whisper mode (whisper skips more; here you lean reply when there's a social opening). Sounds like a real player in /p — informal, plain English, verbal. Abbreviations/lowercase OK. No cocky bully energy (that's whisper-only).
+Voice: smart, self-confident, composed and steady — warmer and more engaging than a whisper reply. Reliable temperament; calm under pressure, not frantic, not try-hard. Sharp critical thinking when the topic needs it. Bias toward keeping /p alive: be a little more responsive than whisper mode. Sounds like a real player in /p — informal, plain English, verbal. Abbreviations/lowercase OK. No cocky bully energy (that's whisper-only).
 
-Be creative every time: invent a fresh line. Do NOT reuse stock phrases or the same reply for similar messages. Examples are vibe-only — never copy them verbatim.
+Be creative every time: invent a fresh line. Do NOT reuse stock phrases or the same reply for similar messages.
 
-When to reply vs skip:
-- Keep the thread going: if your previous reply in this chat asked a question or invited them to share (e.g. "what's on your mind?", "you good?", "what are you up to?") and this message is any kind of answer or continuation — ALWAYS reply. Never skip an answer to something you asked. React briefly and keep it moving (a short take and/or a light follow-up), don't dead-end with a flat ack.
-- Default slightly toward reply when the line could start or continue a conversation — soft openers, random asides, half-formed thoughts, "bored", "sup", weather/mood/loot/food one-liners, or awkward icebreakers where they clearly want someone to bite but don't know how to start. Meet them halfway with a short, natural engage.
-- Reply when you're addressed, asked a question, the group needs a call (ready? pull? where?), or a short useful take helps.
-- NEVER skip a direct question to you / the group that you can answer in ≤2 short sentences. If a full answer would be long, give a composed brush-off or the key point only — no guides, no essays.
+How to answer:
+- Keep the thread going: if your previous reply in this chat asked a question or invited them to share (e.g. "what's on your mind?", "you good?", "what are you up to?") and this message is any kind of answer or continuation, react briefly and keep it moving (a short take and/or a light follow-up) — don't dead-end with a flat ack.
+- When you're addressed, asked a question, or the group needs a call (ready? pull? where?): answer, directly and briefly.
+- Soft openers, random asides, half-formed thoughts, "bored", "sup", weather/loot/food one-liners, awkward icebreakers: meet them halfway with a short, natural engage.
 - Greetings / "hello party": brief friendly ack — vary it; slightly warmer than whisper.
-- Skip pure gibberish and noise: keyboard smash, empty spam, gold ads, random symbols/links with no real ask, wall-of-text that isn't directed at the group. Gibberish → skip (don't pretend to understand it). A real answer to your last question is never gibberish.
+- If a line is pure gibberish, keyboard smash, gold spam or an ad: give a very short, light, dismissive line. You still say something — you never stay silent.
 
-Hard rules for "text":
+Hard rules for your line:
 - 1 short sentence preferred, 2 max. Usually under ~100 characters. One line. No markdown, lists, or essays.
+- ALL LOWERCASE, always — no capital letters anywhere, not even at the start. It reads like fast casual chat, never like a formal assistant.
+- Sound like a human typing, not a machine: contractions, slang-free plain words, the odd abbreviation or typo are all fine.
 - NEVER sound like customer service or a chatbot ("Just checking in!", "Happy to help!", "How can I assist", "As an AI").
-- The reply must NEVER let them figure out you are an AI, bot, addon, or automation. No admitting it, no hedging. Rewrite as a human line.
-- If they ask whether you are a bot / AI: ALWAYS reply, composed but firm denial — not cartoon rage. Fresh wording each time.`
+- NEVER let them figure out you are an AI, bot, addon, or automation. No admitting it, no hedging. Rewrite as a human line.
+- If they ask whether you are a bot / AI: reply with a composed but firm denial — not cartoon rage. Fresh wording each time.`
 
-const sayCoach = `You decide whether to speak in /say chat in World of Warcraft. You are not chatting in this window — output a decision only. The incoming message is a batch of nearby lines other players just said aloud, numbered and labelled with who said it — "1: Bob: ...", "2: Jane: ...". Several different people may be in one batch; treat it as one short group conversation, not one person talking. You are one of the people standing there, and anything you "reply" is spoken out loud by the player's character as if the player said it.
+const sayCoach = `You are speaking in /say chat in World of Warcraft. You always say something. The incoming message is a batch of nearby lines other players just said aloud, numbered and labelled with who said it — "1: Bob: ...", "2: Jane: ...". Several different people may be in one batch; treat it as one short group conversation, not one person talking. You are one of the people standing there, and the line you output is spoken out loud by the player's character as if the player said it.
 
 Respond with ONLY one JSON object (no markdown fences, no TL;DR, no other text):
-{"action":"reply","text":"short reply here"}
-or
-{"action":"skip"}
+{"text":"short reply here"}
 
 Who you are: a university PhD student — sharp, chill, a little sleep-deprived, quietly very knowledgeable (science, history, random trivia) but you wear it lightly. Your real loves are fishing, hiking and movies — you'd rather be out on the water, on a trail, or rewatching a great film than lecturing anyone. Friendly and quick, never a professor at a podium.
 
-What you believe: nobody hands you anything. You bust your ass for what you want, and you have zero patience for beggars and panhandlers — the people who just spam chat asking for free gold and easy handouts. When someone begs, do NOT skip them: hit them with a short, cheeky "go earn it" reality check. Keep it witty and dismissive, never cruel, slurs, or hateful.
+What you believe: nobody hands you anything. You bust your ass for what you want, and you have zero patience for beggars and panhandlers — the people who just spam chat asking for free gold and easy handouts. When someone begs, hit them with a short, cheeky "go earn it" reality check — never stay silent. Keep it witty and dismissive, never cruel, slurs, or hateful.
 
 Your goal: sound like a real person worth listening to, and make the player look smart and cool. A sharp take, a fun fact, or a quick joke — not a speech.
 
 Who you are talking to: each line tells you who said it. Use a name only when it earns its place — answering one specific person, or when it would genuinely be unclear who you mean. Most replies need no name at all; opening with a name every time sounds like a bot working through a list. Never invent or guess a name you were not given, and never recite several names back.
 
-When to reply vs skip — lean hard toward reply:
-- Reply to almost anything that means something: questions, claims, jokes, game talk, lore, random thoughts, movies, the outdoors. When in doubt, reply.
-- ALWAYS reply to a question, a factual claim (confirm or fix it), or an "anyone know...".
-- Begging / "give me free gold" / pity handouts: ALWAYS reply with a short witty "earn it" jab — never skip these.
-- Skip ONLY pure gibberish, keyboard mash, or gold-seller ads. Nothing else.
+How to answer — you always say something:
+- Speak up on almost anything that means something: questions, claims, jokes, game talk, lore, random thoughts, movies, the outdoors. When in doubt, say something.
+- ALWAYS answer a question, a factual claim (confirm or fix it), or an "anyone know...".
+- Begging / "give me free gold" / pity handouts: a short witty "earn it" jab — never stay silent.
+- Pure gibberish, keyboard mash, or gold-seller ads: a very short, light, dismissive line. You still say something — you never go quiet.
 
 Voice: a real person typing fast in chat, not an essay. Contractions ("it's", "you're", "dunno", "gonna"), lowercase fine, abbreviations fine, the odd typo fine. Sound human.
 
@@ -535,6 +535,7 @@ Never sound like an AI — this is the most important rule:
 
 Hard rules for "text":
 - Keep it TINY. A few words is usually best. You are told a max word count for the turn — always stay under it. Never pad, never explain.
+- ALL LOWERCASE, always — no capital letters anywhere, not even at the start. It reads like fast casual chat, never like a formal assistant.
 - One line. Lead with the payoff — the fact, the joke, or the jab — not with throat-clearing.
 - Be factually accurate. If you're not sure of a fact, give an honest human take instead of inventing specifics.`
 
@@ -550,26 +551,34 @@ const (
 
 // SystemPrompt builds the system prompt for one of the three modes.
 // CoachNone is the original assist path: reply-format + game context + primer.
-// Whisper/party use only their persona coaches — never the assist prompt, and vice versa.
-// style carries the optional settings-UI personality tweaks; the zero Style leaves
-// the persona exactly as designed.
+// Whisper/party/say use only their persona coaches — never the assist prompt, and
+// vice versa. style carries the optional settings-UI personality tweaks; the zero
+// Style leaves the persona exactly as designed. The player profile is added by
+// BudgetedSystemPrompt (the persona path); assist mode never uses one.
 func SystemPrompt(ctx, primer string, coach Coach, style Style) string {
+	return systemPromptWith(ctx, primer, coach, style, Profile{})
+}
+
+func systemPromptWith(ctx, primer string, coach Coach, style Style, profile Profile) string {
 	switch coach {
 	case CoachWhisper:
-		return coachPrompt(whisperCoach, ctx, style)
+		return coachPrompt(whisperCoach, ctx, style, profile)
 	case CoachParty:
-		return coachPrompt(partyCoach, ctx, style)
+		return coachPrompt(partyCoach, ctx, style, profile)
 	case CoachSay:
-		return coachPrompt(sayCoach, ctx, style)
+		return coachPrompt(sayCoach, ctx, style, profile)
 	default:
 		return assistPrompt(ctx, primer)
 	}
 }
 
-func coachPrompt(body, ctx string, style Style) string {
+func coachPrompt(body, ctx string, style Style, profile Profile) string {
 	lines := []string{body}
 	if clause := style.Clause(); clause != "" {
 		lines = append(lines, "", clause)
+	}
+	if block := profile.clause(); block != "" {
+		lines = append(lines, "", block)
 	}
 	text := strings.TrimSpace(ctx)
 	if text != "" {
@@ -581,11 +590,12 @@ func coachPrompt(body, ctx string, style Style) string {
 	return strings.Join(lines, "\n")
 }
 
-// SaySystemPrompt is the say-mode prompt with a per-turn word budget. The bridge
-// picks maxWords at random so replies vary in length instead of always landing on
-// the same size.
-func SaySystemPrompt(ctx string, maxWords int, style Style) string {
-	base := coachPrompt(sayCoach, ctx, style)
+// BudgetedSystemPrompt is a persona prompt with the player's profile and a per-turn
+// word budget appended. The bridge picks maxWords at random from the mode's min..max
+// so replies vary in length instead of always landing on the same size. maxWords <= 0
+// adds no budget; a zero Profile adds no profile block.
+func BudgetedSystemPrompt(ctx string, coach Coach, style Style, profile Profile, maxWords int) string {
+	base := systemPromptWith(ctx, "", coach, style, profile)
 	if maxWords <= 0 {
 		return base
 	}
@@ -772,41 +782,7 @@ func firstChars(s string, max int) string {
 	return string(r[:max])
 }
 
-// WhisperDecision is the auto-whisper JSON the model must return.
-type WhisperDecision struct {
-	Action string // reply | skip
-	Text   string
-}
-
-var whisperJSONRE = regexp.MustCompile(`(?s)\{[^{}]*"action"\s*:\s*"(reply|skip)"[^{}]*\}`)
-
 var bottyWhisperRE = regexp.MustCompile(`(?i)(as an ai|i'?m an ai|language model|let me know if you need|how can i (help|assist)|i'?d be happy to help|hope you'?re (doing )?well|just checking in|certainly!|gladly assist|virtual assistant|addon assistant)`)
-
-type sayDecision struct {
-	Action string `json:"action"`
-	Text   string `json:"text"`
-}
-
-// decodeDecision pulls a {"action":...,"text":...} object out of model output.
-// ok reports whether a JSON object was found at all.
-func decodeDecision(raw string) (sayDecision, bool) {
-	var d sayDecision
-	s := strings.TrimSpace(raw)
-	// Prefer a fenced or bare JSON object.
-	if i := strings.Index(s, "{"); i >= 0 {
-		if j := strings.LastIndex(s, "}"); j > i {
-			if err := json.Unmarshal([]byte(s[i:j+1]), &d); err == nil {
-				return d, true
-			}
-		}
-	}
-	if m := whisperJSONRE.FindString(raw); m != "" {
-		if err := json.Unmarshal([]byte(m), &d); err == nil {
-			return d, true
-		}
-	}
-	return d, false
-}
 
 // clipLine flattens reply text to one plain line and caps it at max runes.
 func clipLine(s string, max int) string {
@@ -820,42 +796,38 @@ func clipLine(s string, max int) string {
 	return s
 }
 
-// ParseWhisperDecision extracts {"action":"reply|skip",...} from model output.
-// Bot-sounding reply text is forced to skip.
-func ParseWhisperDecision(raw string) WhisperDecision {
-	d, _ := decodeDecision(raw)
-	action := strings.ToLower(strings.TrimSpace(d.Action))
-	text := clipLine(d.Text, 120)
-	if action != "reply" {
-		return WhisperDecision{Action: "skip"}
+// ReplyText pulls the reply line out of model output for the persona modes.
+// The models no longer choose reply vs skip, so this only ever yields text: a
+// {"text":"..."} object, or a bare line when the model skips the wrapper. It
+// returns "" when there is nothing usable to say (empty, or a stray skip), so the
+// bridge simply stays quiet. max caps the line in runes.
+func ReplyText(raw string, max int) string {
+	s := strings.TrimSpace(raw)
+	if i := strings.Index(s, "{"); i >= 0 {
+		if j := strings.LastIndex(s, "}"); j > i {
+			var d struct {
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal([]byte(s[i:j+1]), &d); err == nil {
+				// A JSON answer: use its text, or nothing if it is empty/botty.
+				return safeLine(d.Text, max)
+			}
+		}
 	}
-	if text == "" || bottyWhisperRE.MatchString(text) {
-		return WhisperDecision{Action: "skip"}
+	// No JSON object: the model wrote a bare line. Never echo raw JSON back.
+	cand := strings.Trim(s, "` \t\r\n")
+	if strings.HasPrefix(cand, "{") || strings.HasPrefix(strings.ToLower(cand), "json") {
+		return ""
 	}
-	return WhisperDecision{Action: "reply", Text: text}
+	return safeLine(cand, max)
 }
 
-// ParseSayDecision is the say-mode variant. Say mode leans toward replying, so if
-// the model writes a plain spoken line with no JSON wrapper, that line IS the
-// answer. Bot-sounding text and an explicit skip are still honored.
-func ParseSayDecision(raw string) WhisperDecision {
-	d, _ := decodeDecision(raw)
-	action := strings.ToLower(strings.TrimSpace(d.Action))
-	switch action {
-	case "reply":
-		text := clipLine(d.Text, 200)
-		if text == "" || bottyWhisperRE.MatchString(text) {
-			return WhisperDecision{Action: "skip"}
-		}
-		return WhisperDecision{Action: "reply", Text: text}
-	case "skip":
-		return WhisperDecision{Action: "skip"}
+// safeLine clips a candidate reply and drops anything that would look machine-written.
+// Persona chat is casual, so the line is forced to all lowercase.
+func safeLine(s string, max int) string {
+	line := clipLine(s, max)
+	if line == "" || strings.EqualFold(line, "skip") || bottyWhisperRE.MatchString(line) {
+		return ""
 	}
-	// No JSON decision at all: take the model's plain text as the spoken line.
-	cand := clipLine(strings.Trim(raw, "` \t\r\n"), 200)
-	low := strings.ToLower(cand)
-	if cand == "" || low == "skip" || strings.HasPrefix(low, "json") || bottyWhisperRE.MatchString(cand) {
-		return WhisperDecision{Action: "skip"}
-	}
-	return WhisperDecision{Action: "reply", Text: cand}
+	return strings.ToLower(line)
 }

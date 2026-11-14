@@ -6,14 +6,16 @@ import "strings"
 // An empty field means "leave that mode's built-in persona exactly as designed",
 // which keeps the hand-tuned whisper/party/say voices intact by default.
 //
-// The three axes are deliberately different things:
+// The axes are deliberately different things:
 //   - Personality     = how the character comes across (tone, attitude)
-//   - EducationLevels  = the register/vocabulary they speak in (how smart they read)
-//   - Characteristics  = the behavioral tendency (what they notice and do)
+//   - EducationLevels = the register/vocabulary they speak in (how smart they read)
+//   - Characteristics = the behavioral tendency (what they notice and do)
+//   - SlangLevels     = how much casual slang/shorthand they use (how they type)
 type Style struct {
 	Personality     string
 	Education       string
 	Characteristics string
+	Slang           string
 }
 
 // StyleOption is one selectable value in a style dropdown. Key is what gets
@@ -65,6 +67,16 @@ var Characteristics = []StyleOption{
 	{Key: "skeptical", Label: "Skeptical", Clause: "Stay skeptical — question the claim before you agree with it."},
 }
 
+// SlangLevels shape how much casual slang/shorthand the reply uses — how the
+// character types, not what they say. Every level still forbids sounding artificial.
+var SlangLevels = []StyleOption{
+	{Key: "", Label: "Default (as designed)"},
+	{Key: "none", Label: "None", Clause: "Never use slang or internet shorthand — plain, ordinary words only."},
+	{Key: "rare", Label: "Rarely", Clause: "Use slang very rarely — at most the odd word every twenty lines or so."},
+	{Key: "some", Label: "Sometimes", Clause: "Use casual slang now and then when it fits — a natural sprinkle, never every line."},
+	{Key: "lots", Label: "A lot", Clause: "Use casual gaming slang freely, like a player typing fast in chat — but never stack it or force it."},
+}
+
 func lookupOption(opts []StyleOption, key string) string {
 	for _, o := range opts {
 		if o.Key == key {
@@ -76,7 +88,7 @@ func lookupOption(opts []StyleOption, key string) string {
 
 // IsZero reports whether no style tweak was chosen.
 func (s Style) IsZero() bool {
-	return s.Personality == "" && s.Education == "" && s.Characteristics == ""
+	return s.Personality == "" && s.Education == "" && s.Characteristics == "" && s.Slang == ""
 }
 
 // Clause renders the chosen tweaks as an extra block for the system prompt.
@@ -95,6 +107,9 @@ func (s Style) Clause() string {
 	}
 	if c := lookupOption(Characteristics, s.Characteristics); c != "" {
 		parts = append(parts, "Characteristic: "+c)
+	}
+	if c := lookupOption(SlangLevels, s.Slang); c != "" {
+		parts = append(parts, "Slang level: "+c)
 	}
 	if len(parts) == 0 {
 		return ""

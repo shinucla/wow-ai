@@ -76,7 +76,7 @@ func (f *fakeLLM) server() *httptest.Server {
 		f.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"choices": []map[string]interface{}{
-				{"message": map[string]string{"content": `{"action":"reply","text":"Paris."}`}},
+				{"message": map[string]string{"content": `{"text":"Paris."}`}},
 			},
 		})
 	})
@@ -159,7 +159,7 @@ func TestSayFlushShipsBatchAndClears(t *testing.T) {
 	deadline = time.Now().Add(3 * time.Second)
 	for {
 		b, err := os.ReadFile(slot)
-		if err == nil && strings.Contains(string(b), `sayText = "Paris."`) {
+		if err == nil && strings.Contains(string(b), `sayText = "paris."`) {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -383,5 +383,52 @@ func TestSaySpeakerLabelReachesModelAndHistory(t *testing.T) {
 			t.Fatal("say history was never recorded")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func partyJob(id int, text string) protocol.Job {
+	return protocol.Job{
+		Session: "sess", Chat: "partychat", ID: id, Cwd: "",
+		Text: text, PartyHelp: true, Instance: 1, Via: "pixel",
+	}
+}
+
+// A lowered party reply chance skips on purpose without waking the model, and
+// still publishes a done reply so the addon stops waiting on that id.
+func TestPartyReplyChanceSkipsWithoutCallingModel(t *testing.T) {
+	fake := &fakeLLM{}
+	srv := fake.server()
+	defer srv.Close()
+	e, dir := newTestEngine(t, srv.URL)
+
+	e.Cfg.Modes.Party.ReplyChance = config.Int(0)
+	e.dispatch(context.Background(), partyJob(1, "Bob: ready?"))
+
+	time.Sleep(60 * time.Millisecond)
+	if fake.calls() != 0 {
+		t.Fatalf("reply chance 0 must not reach the LLM, got %d calls", fake.calls())
+	}
+	slot := filepath.Join(dir, "WoWAI_I01_S001", "Inbox.lua")
+	b, err := os.ReadFile(slot)
+	if err != nil || !strings.Contains(string(b), `status = "done"`) {
+		t.Fatalf("a chance-skip should still publish a done reply so the addon stops waiting (err=%v):\n%s", err, b)
+	}
+}
+
+// The default (100%) still asks the model for party lines, like whisper always does.
+func TestPartyReplyChanceDefaultAsksModel(t *testing.T) {
+	fake := &fakeLLM{}
+	srv := fake.server()
+	defer srv.Close()
+	e, _ := newTestEngine(t, srv.URL)
+
+	e.dispatch(context.Background(), partyJob(1, "Bob: ready?"))
+
+	deadline := time.Now().Add(3 * time.Second)
+	for fake.calls() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if fake.calls() != 1 {
+		t.Fatalf("party at 100%% should ask the model, got %d calls", fake.calls())
 	}
 }

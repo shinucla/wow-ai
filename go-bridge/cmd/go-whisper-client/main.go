@@ -77,8 +77,7 @@ func runOne(client *llm.Client, incoming, gameCtx string, timeout time.Duration)
 	out := map[string]interface{}{
 		"incoming": incoming,
 		"raw":      res.Raw,
-		"action":   res.Decision.Action,
-		"text":     res.Decision.Text,
+		"text":     res.Text,
 		"would":    would(res),
 	}
 	enc := json.NewEncoder(os.Stdout)
@@ -87,8 +86,8 @@ func runOne(client *llm.Client, incoming, gameCtx string, timeout time.Duration)
 }
 
 func would(res whisper.Result) string {
-	if res.Decision.Action == "reply" {
-		return fmt.Sprintf("SendChatMessage %q", res.Decision.Text)
+	if res.Text != "" {
+		return fmt.Sprintf("SendChatMessage %q", res.Text)
 	}
 	return "no whisper sent"
 }

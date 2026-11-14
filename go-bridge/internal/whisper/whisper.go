@@ -16,10 +16,10 @@ func SystemPrompt(gameCtx string) string {
 	return protocol.SystemPrompt(gameCtx, "", protocol.CoachWhisper, protocol.Style{})
 }
 
-func Parse(raw string) protocol.WhisperDecision {
-	return protocol.ParseWhisperDecision(raw)
+func Parse(raw string) string {
+	return protocol.ReplyText(raw, 200)
 }
 
 func Decide(ctx context.Context, client Chatter, incoming, gameCtx string, history []llm.Message) (Result, error) {
-	return autochat.Decide(ctx, client, protocol.CoachWhisper, incoming, gameCtx, history, protocol.Style{})
+	return autochat.Decide(ctx, client, protocol.CoachWhisper, incoming, gameCtx, history, 0, protocol.Style{}, protocol.Profile{})
 }

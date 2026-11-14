@@ -17,5 +17,5 @@ func SystemPrompt(gameCtx string) string {
 }
 
 func Decide(ctx context.Context, client Chatter, incoming, gameCtx string, history []llm.Message) (Result, error) {
-	return autochat.Decide(ctx, client, protocol.CoachParty, incoming, gameCtx, history, protocol.Style{})
+	return autochat.Decide(ctx, client, protocol.CoachParty, incoming, gameCtx, history, 0, protocol.Style{}, protocol.Profile{})
 }

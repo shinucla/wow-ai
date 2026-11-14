@@ -22,16 +22,17 @@ func TestStyleOptionsEndpoint(t *testing.T) {
 		} `json:"personalities"`
 		Education       []map[string]string `json:"education"`
 		Characteristics []map[string]string `json:"characteristics"`
+		Slang           []map[string]string `json:"slang"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decoding response: %v", err)
 	}
-	if len(body.Personalities) < 5 || len(body.Education) < 3 || len(body.Characteristics) < 5 {
-		t.Fatalf("too few options: %d/%d/%d",
-			len(body.Personalities), len(body.Education), len(body.Characteristics))
+	if len(body.Personalities) < 5 || len(body.Education) < 3 || len(body.Characteristics) < 5 || len(body.Slang) < 4 {
+		t.Fatalf("too few options: %d/%d/%d/%d",
+			len(body.Personalities), len(body.Education), len(body.Characteristics), len(body.Slang))
 	}
 	// The first entry of each list must be the "leave it as designed" default.
-	for _, list := range [][]map[string]string{body.Education, body.Characteristics} {
+	for _, list := range [][]map[string]string{body.Education, body.Characteristics, body.Slang} {
 		if list[0]["key"] != "" {
 			t.Fatalf("first option should be the empty default, got %q", list[0]["key"])
 		}

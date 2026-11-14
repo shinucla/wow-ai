@@ -26,6 +26,19 @@ type Config struct {
 	Capture            CaptureConfig `json:"capture"`
 	LLM                LLMConfig     `json:"llm"`
 	Modes              ModesConfig   `json:"modes"`
+	Profile            ProfileConfig `json:"profile"`
+}
+
+// ProfileConfig is the player's own reference material for the persona modes — the
+// "Myself" tab. It is free text per category, injected into the whisper/party/say
+// prompts so the personas sound like the same real person and can answer things like
+// "what do you think of that guild?" from the player's actual views. The per-mode
+// reply style stays dominant; this is background used only when it fits. Tone and
+// slang are deliberately NOT here — those live in each mode's Reply style.
+type ProfileConfig struct {
+	About     string `json:"about"`     // who I am: age, work/study, region, how long I've played, main
+	Interests string `json:"interests"` // interests & hobbies, in game and out
+	Opinions  string `json:"opinions"`  // opinions & hot takes, in game and general
 }
 
 // ModesConfig holds the per-mode bridge switches and tuning for the persona
@@ -40,13 +53,22 @@ type ModesConfig struct {
 // addon checkbox still decides whether a job is sent at all; this lets the
 // bridge ignore jobs for a mode without re-installing the addon.
 //
+// ReplyChance is the percent of incoming lines the mode answers (0..100); the
+// rest are skipped on the bridge side without asking the model. Nil means 100.
+// MinWords/MaxWords bound the reply length; a random budget in that range is
+// handed to the model each turn and enforced as a hard clip.
+//
 // Personality/Education/Characteristics are optional style keys (see
 // protocol.Personalities and friends). Empty means "persona as designed".
 type ModeConfig struct {
 	Enabled         *bool  `json:"enabled"`
+	ReplyChance     *int   `json:"replyChance"`
+	MinWords        *int   `json:"minWords"`
+	MaxWords        *int   `json:"maxWords"`
 	Personality     string `json:"personality"`
 	Education       string `json:"education"`
 	Characteristics string `json:"characteristics"`
+	Slang           string `json:"slang"`
 }
 
 // SayModeConfig tunes the surrounding-/say collector.
@@ -59,6 +81,7 @@ type SayModeConfig struct {
 	Personality     string `json:"personality"`
 	Education       string `json:"education"`
 	Characteristics string `json:"characteristics"`
+	Slang           string `json:"slang"`
 }
 
 // Bool and Int return pointers for the nullable mode fields, whose nil value
@@ -113,11 +136,11 @@ func Default() Config {
 			Temperature: 0.7,
 		},
 		Modes: ModesConfig{
-			Whisper: ModeConfig{Enabled: Bool(true)},
-			Party:   ModeConfig{Enabled: Bool(true)},
+			Whisper: ModeConfig{Enabled: Bool(true), ReplyChance: Int(100), MinWords: Int(4), MaxWords: Int(13)},
+			Party:   ModeConfig{Enabled: Bool(true), ReplyChance: Int(100), MinWords: Int(4), MaxWords: Int(13)},
 			Say: SayModeConfig{
 				Enabled:        Bool(true),
-				ReplyChance:    Int(50),
+				ReplyChance:    Int(100),
 				CollectSeconds: Int(10),
 				MinWords:       Int(4),
 				MaxWords:       Int(13),
@@ -220,8 +243,26 @@ func (c *Config) ApplyDefaults() {
 	if c.Modes.Whisper.Enabled == nil {
 		c.Modes.Whisper.Enabled = d.Modes.Whisper.Enabled
 	}
+	if c.Modes.Whisper.ReplyChance == nil {
+		c.Modes.Whisper.ReplyChance = d.Modes.Whisper.ReplyChance
+	}
+	if c.Modes.Whisper.MinWords == nil {
+		c.Modes.Whisper.MinWords = d.Modes.Whisper.MinWords
+	}
+	if c.Modes.Whisper.MaxWords == nil {
+		c.Modes.Whisper.MaxWords = d.Modes.Whisper.MaxWords
+	}
 	if c.Modes.Party.Enabled == nil {
 		c.Modes.Party.Enabled = d.Modes.Party.Enabled
+	}
+	if c.Modes.Party.ReplyChance == nil {
+		c.Modes.Party.ReplyChance = d.Modes.Party.ReplyChance
+	}
+	if c.Modes.Party.MinWords == nil {
+		c.Modes.Party.MinWords = d.Modes.Party.MinWords
+	}
+	if c.Modes.Party.MaxWords == nil {
+		c.Modes.Party.MaxWords = d.Modes.Party.MaxWords
 	}
 	if c.Modes.Say.Enabled == nil {
 		c.Modes.Say.Enabled = d.Modes.Say.Enabled
@@ -254,26 +295,41 @@ func (c Config) ModeEnabled(mode string) bool {
 	return true
 }
 
-// ModeStyle returns the chosen personality/education/characteristics keys for a
-// persona mode ("whisper", "party", "say"). Empty strings mean "as designed".
-func (c Config) ModeStyle(mode string) (personality, education, characteristics string) {
+// ModeStyle returns the chosen personality/education/characteristics/slang keys for
+// a persona mode ("whisper", "party", "say"). Empty strings mean "as designed".
+func (c Config) ModeStyle(mode string) (personality, education, characteristics, slang string) {
 	switch mode {
 	case "whisper":
 		m := c.Modes.Whisper
-		return m.Personality, m.Education, m.Characteristics
+		return m.Personality, m.Education, m.Characteristics, m.Slang
 	case "party":
 		m := c.Modes.Party
-		return m.Personality, m.Education, m.Characteristics
+		return m.Personality, m.Education, m.Characteristics, m.Slang
 	case "say":
 		m := c.Modes.Say
-		return m.Personality, m.Education, m.Characteristics
+		return m.Personality, m.Education, m.Characteristics, m.Slang
 	}
-	return "", "", ""
+	return "", "", "", ""
+}
+
+// ModeReplyChancePct is the percent of incoming lines a persona mode ("whisper",
+// "party", "say") answers; the rest are skipped on the bridge side without asking
+// the model. Nil means 100. A mode without a setting (assist) is always 100.
+func (c Config) ModeReplyChancePct(mode string) int {
+	switch mode {
+	case "whisper":
+		return clampInt(intVal(c.Modes.Whisper.ReplyChance, 100), 0, 100)
+	case "party":
+		return clampInt(intVal(c.Modes.Party.ReplyChance, 100), 0, 100)
+	case "say":
+		return clampInt(intVal(c.Modes.Say.ReplyChance, 100), 0, 100)
+	}
+	return 100
 }
 
 // SayReplyChancePct is the percent of collected say batches that get answered.
 func (c Config) SayReplyChancePct() int {
-	return clampInt(intVal(c.Modes.Say.ReplyChance, 50), 0, 100)
+	return c.ModeReplyChancePct("say")
 }
 
 // SayCollectSeconds is how long the say collector gathers before deciding.
@@ -281,14 +337,26 @@ func (c Config) SayCollectSeconds() int {
 	return clampInt(intVal(c.Modes.Say.CollectSeconds, 10), 1, 300)
 }
 
-// SayWordRange is the shortest and longest say reply, in words.
-func (c Config) SayWordRange() (int, int) {
-	lo := clampInt(intVal(c.Modes.Say.MinWords, 4), 1, 100)
-	hi := clampInt(intVal(c.Modes.Say.MaxWords, 13), 1, 100)
-	if hi < lo {
-		lo, hi = hi, lo
+// ModeWordRange is the shortest and longest reply for a persona mode, in words.
+// The bridge picks a random budget in that range per turn.
+func (c Config) ModeWordRange(mode string) (int, int) {
+	var lo, hi *int
+	switch mode {
+	case "whisper":
+		lo, hi = c.Modes.Whisper.MinWords, c.Modes.Whisper.MaxWords
+	case "party":
+		lo, hi = c.Modes.Party.MinWords, c.Modes.Party.MaxWords
+	case "say":
+		lo, hi = c.Modes.Say.MinWords, c.Modes.Say.MaxWords
+	default:
+		return 4, 13
 	}
-	return lo, hi
+	l := clampInt(intVal(lo, 4), 1, 100)
+	h := clampInt(intVal(hi, 13), 1, 100)
+	if h < l {
+		l, h = h, l
+	}
+	return l, h
 }
 
 func intVal(p *int, def int) int {

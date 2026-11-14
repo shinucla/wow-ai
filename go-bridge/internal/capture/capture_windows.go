@@ -49,6 +49,21 @@ var (
 
 var dpiOnce sync.Once
 
+// EnumWindows needs a Go function pointer, and Go hard-caps those at cb_max
+// (2000) — past it the runtime throws "too many callback functions" and the whole
+// process dies. So the callback is registered exactly once and reused; the
+// filter arguments for the current pass live in these package vars, guarded by
+// enumMu (EnumWindows is synchronous, and concurrent listWindows calls — e.g. the
+// capture loop and the Probe button — must not share the scratch slice).
+var (
+	enumMu      sync.Mutex
+	enumOnce    sync.Once
+	enumCB      uintptr
+	enumProcess string
+	enumTitle   string
+	enumFound   []winInfo
+)
+
 const (
 	srcCopy             = 0x00CC0020
 	processQueryLimited = 0x1000
@@ -81,11 +96,11 @@ type bitmapInfo struct {
 }
 
 type winInfo struct {
-	HWND         syscall.Handle
-	PID          uint32
-	Left, Top    int32
-	Title        string
-	Instance     int
+	HWND      syscall.Handle
+	PID       uint32
+	Left, Top int32
+	Title     string
+	Instance  int
 }
 
 // WindowsRunner captures every matching WoW window via GDI.
@@ -305,40 +320,50 @@ func windowSignature(wins []winInfo) string {
 	return s
 }
 
-func listWindows(processName, titleSub string, maxInstances int) []winInfo {
-	var found []winInfo
-	cb := syscall.NewCallback(func(hwnd syscall.Handle, _ uintptr) uintptr {
-		vis, _, _ := procIsWindowVisible.Call(uintptr(hwnd))
-		if vis == 0 {
+// enumWindowsProc is the one-time EnumWindows callback. It filters on the
+// package-level enumProcess/enumTitle set by listWindows and appends matches to
+// enumFound. It runs on the calling goroutine (EnumWindows is synchronous).
+func enumWindowsProc(hwnd syscall.Handle, _ uintptr) uintptr {
+	vis, _, _ := procIsWindowVisible.Call(uintptr(hwnd))
+	if vis == 0 {
+		return 1
+	}
+	if enumTitle != "" {
+		if !containsFold(windowTitle(hwnd), enumTitle) {
 			return 1
 		}
-		if titleSub != "" {
-			t := windowTitle(hwnd)
-			if !containsFold(t, titleSub) {
-				return 1
-			}
+	}
+	var pid uint32
+	procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
+	if enumProcess != "" {
+		name := processBaseName(pid)
+		if !equalsFold(name, enumProcess) && !equalsFold(name, enumProcess+".exe") {
+			return 1
 		}
-		var pid uint32
-		procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
-		if processName != "" {
-			name := processBaseName(pid)
-			if !equalsFold(name, processName) && !equalsFold(name, processName+".exe") {
-				return 1
-			}
-		}
-		var wr rect
-		procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&wr)))
-		found = append(found, winInfo{
-			HWND:  hwnd,
-			PID:   pid,
-			Left:  wr.Left,
-			Top:   wr.Top,
-			Title: windowTitle(hwnd),
-		})
-		return 1
+	}
+	var wr rect
+	procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&wr)))
+	enumFound = append(enumFound, winInfo{
+		HWND:  hwnd,
+		PID:   pid,
+		Left:  wr.Left,
+		Top:   wr.Top,
+		Title: windowTitle(hwnd),
 	})
-	procEnumWindows.Call(cb, 0)
+	return 1
+}
 
+func listWindows(processName, titleSub string, maxInstances int) []winInfo {
+	enumMu.Lock()
+	defer enumMu.Unlock()
+	// Register the callback once, ever: Go has a fixed number of callback slots.
+	enumOnce.Do(func() { enumCB = syscall.NewCallback(enumWindowsProc) })
+	enumProcess, enumTitle = processName, titleSub
+	enumFound = enumFound[:0]
+	procEnumWindows.Call(enumCB, 0)
+
+	// Copy out: the shared scratch slice is reused by the next call.
+	found := append([]winInfo(nil), enumFound...)
 	sort.Slice(found, func(i, j int) bool {
 		if found[i].Left != found[j].Left {
 			return found[i].Left < found[j].Left
@@ -671,7 +696,6 @@ func capturePrintWindowCornerCached(hwnd syscall.Handle, w, h int, cache *hwndCa
 func capturePrintWindowCorner(hwnd syscall.Handle, w, h int) (*image.RGBA, error) {
 	return capturePrintWindowCornerCached(hwnd, w, h, nil)
 }
-
 
 func clientOrigin(hwnd syscall.Handle) (int32, int32, error) {
 	ensureDPIAware()

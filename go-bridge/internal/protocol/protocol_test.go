@@ -61,40 +61,6 @@ func TestJobsInstanceFlag(t *testing.T) {
 	}
 }
 
-func TestWhisperHelpFlagAndPrompt(t *testing.T) {
-	payload := strings.Join([]string{"s", "c", "4", "", "w", "W: Bob", "help me reply"}, "\x1f")
-	jobs := protocol.JobsFromStrip(0, payload)
-	if len(jobs) != 1 || !jobs[0].WhisperHelp {
-		t.Fatalf("%+v", jobs)
-	}
-	s := protocol.SystemPrompt("", "", protocol.CoachWhisper, protocol.Style{})
-	if !strings.Contains(s, `"action":"reply"`) || !strings.Contains(s, "NEVER skip a question") || !strings.Contains(s, "Just checking in!") {
-		t.Fatal(s)
-	}
-	if !strings.Contains(s, "are you a bot") || !strings.Contains(s, "Be creative every time") {
-		t.Fatal(s)
-	}
-	if strings.Contains(protocol.SystemPrompt("", "", protocol.CoachNone, protocol.Style{}), `"action":"reply"`) {
-		t.Fatal("whisper coach should be opt-in")
-	}
-	chat := protocol.SystemPrompt("Game: WoW\nCharacter: Test, level 80 Human Death Knight\nLocation: Dalaran\nTalents: Blood 51 / Frost 11 / Unholy 0", "primer text", protocol.CoachNone, protocol.Style{})
-	if !strings.Contains(chat, "wow-ai addon") || !strings.Contains(chat, `"TL;DR:"`) {
-		t.Fatal("assist prompt missing reply format")
-	}
-	if !strings.Contains(chat, "AI assistant") {
-		t.Fatal("assist prompt must identify as AI assistant, not a player persona")
-	}
-	if !strings.Contains(chat, "Location: Dalaran") || !strings.Contains(chat, "Talents: Blood") {
-		t.Fatal("assist prompt must include full game context:\n", chat)
-	}
-	if !strings.Contains(chat, "wowmacro") || !strings.Contains(chat, "primer text") {
-		t.Fatal("assist prompt missing macro/primer with context")
-	}
-	if strings.Contains(chat, "cocky alpha-male") || strings.Contains(chat, `"action":"skip"`) || strings.Contains(chat, "composed and steady") {
-		t.Fatal("assist prompt must not include whisper/party persona")
-	}
-}
-
 func TestPartyHelpFlagAndPrompt(t *testing.T) {
 	payload := strings.Join([]string{"s", "c", "5", "", "p", "Party", "Bob: ready?"}, "\x1f")
 	jobs := protocol.JobsFromStrip(0, payload)
@@ -105,17 +71,28 @@ func TestPartyHelpFlagAndPrompt(t *testing.T) {
 	if !strings.Contains(s, "composed and steady") || !strings.Contains(s, "party chat") {
 		t.Fatal(s)
 	}
-	if !strings.Contains(s, "more engaging") || !strings.Contains(s, "Gibberish") {
-		t.Fatal("party should lean more engaging than whisper, and skip gibberish:\n", s)
+	// Party always speaks: no reply/skip decision is handed to the model, and the
+	// bridge's reply chance decides whether the model is asked at all.
+	if !strings.Contains(s, `{"text":"short reply here"}`) || strings.Contains(s, `"action"`) {
+		t.Fatalf("party must request only text:\n%s", s)
 	}
-	if !strings.Contains(s, "Keep the thread going") || !strings.Contains(s, "Never skip an answer") {
+	if !strings.Contains(s, "always say something back") {
+		t.Fatalf("party must always speak:\n%s", s)
+	}
+	// Casual chat casing, like a real player typing fast.
+	if !strings.Contains(s, "ALL LOWERCASE") {
+		t.Fatal("party must ask for all-lowercase lines:\n", s)
+	}
+	if !strings.Contains(s, "more engaging") || !strings.Contains(s, "gibberish") {
+		t.Fatal("party should lean more engaging than whisper, and say something even for gibberish:\n", s)
+	}
+	if !strings.Contains(s, "Keep the thread going") {
 		t.Fatal("party must continue conversations after its own questions:\n", s)
 	}
 	if strings.Contains(s, "cocky alpha-male") {
 		t.Fatal("party must not use whisper voice")
 	}
 }
-
 
 func TestSayHelpFlagAndPrompt(t *testing.T) {
 	payload := strings.Join([]string{"s", "c6", "7", "", "s", "Say", "what is gravity?"}, "\x1f")
@@ -142,8 +119,8 @@ func TestSayHelpFlagAndPrompt(t *testing.T) {
 	if !strings.Contains(s, "Use a name only when it earns its place") || !strings.Contains(s, "Never invent") {
 		t.Fatal("say coach must be told to use names sparingly and never invent one:\n", s)
 	}
-	// The bridge picks a per-turn word budget through SaySystemPrompt.
-	wp := protocol.SaySystemPrompt("", 7, protocol.Style{})
+	// The bridge picks a per-turn word budget through BudgetedSystemPrompt.
+	wp := protocol.BudgetedSystemPrompt("", protocol.CoachSay, protocol.Style{}, protocol.Profile{}, 7)
 	if !strings.Contains(wp, "at most 7 words") {
 		t.Fatal("say prompt must carry the word budget:\n", wp)
 	}
@@ -153,9 +130,12 @@ func TestSayHelpFlagAndPrompt(t *testing.T) {
 	if got := protocol.ClipWords("short line", 9); got != "short line" {
 		t.Fatalf("ClipWords under budget changed text: %q", got)
 	}
-	// The scholar must almost never skip, and must aim to make the player look smart.
-	if !strings.Contains(s, "lean hard toward reply") || !strings.Contains(s, "When in doubt, reply") {
-		t.Fatal("say coach must rarely skip:\n", s)
+	// The scholar always says something; nothing in the prompt offers a skip.
+	if strings.Contains(s, `"action"`) || !strings.Contains(s, "you always say something") {
+		t.Fatal("say coach must always speak and never offer an action:\n", s)
+	}
+	if !strings.Contains(s, "When in doubt, say something") {
+		t.Fatal("say coach must lean toward speaking:\n", s)
 	}
 	if !strings.Contains(s, "make the player look smart") || !strings.Contains(s, "knowledgeable") {
 		t.Fatal("say coach must aim to make the player look smart and knowledgeable:\n", s)
@@ -185,47 +165,33 @@ func TestSayTextSerialized(t *testing.T) {
 	}
 }
 
-func TestParseSayDecisionLeansTowardReply(t *testing.T) {
-	cases := []struct {
-		in, action, text string
-	}{
-		// JSON reply works as usual.
-		{`{"action":"reply","text":"Wish I had 600g to spare myself."}`, "reply", "Wish I had 600g to spare myself."},
-		// A plain spoken line with no JSON must still count as an answer.
-		{`I wish someone would hand me 600g too.`, "reply", "I wish someone would hand me 600g too."},
-		{`  600g? In this economy?  `, "reply", "600g? In this economy?"},
-		// Explicit skip is honored.
-		{`{"action":"skip"}`, "skip", ""},
-		{`skip`, "skip", ""},
-		// Pure noise is still skipped.
-		{`asdlkjhasd`, "reply", "asdlkjhasd"}, // meaning-bearing-ish: lenient parser keeps it
-		// Bot-sounding text is still refused.
-		{`As an AI I cannot help with that.`, "skip", ""},
+// ReplyText is the single parser for all three persona modes: the models no longer
+// choose reply vs skip, so it only ever yields the line (or "" for nothing usable).
+func TestReplyText(t *testing.T) {
+	cases := []struct{ in, want string }{
+		// The requested {"text":...} shape.
+		{`{"text":"ready"}`, "ready"},
+		// Persona chat is forced to all lowercase.
+		{`{"text":"Sure, Paris."}`, "sure, paris."},
+		{`Yeah I'm In`, "yeah i'm in"},
+		// A bare spoken line with no JSON is still the answer.
+		{`I wish someone would hand me 600g too.`, "i wish someone would hand me 600g too."},
+		{`  600g? In this economy?  `, "600g? in this economy?"},
+		// Fenced JSON is unwrapped.
+		{"```json\n{\"text\":\"sup\"}\n```", "sup"},
+		// No usable answer: empty text, a stray skip, or anything bot-sounding.
+		{`{"text":""}`, ""},
+		{`{"action":"skip"}`, ""},
+		{`skip`, ""},
+		{`As an AI I cannot help with that.`, ""},
 	}
 	for _, c := range cases {
-		d := protocol.ParseSayDecision(c.in)
-		if d.Action != c.action || d.Text != c.text {
-			t.Fatalf("%q → %+v want action=%q text=%q", c.in, d, c.action, c.text)
+		if got := protocol.ReplyText(c.in, 200); got != c.want {
+			t.Fatalf("%q → %q want %q", c.in, got, c.want)
 		}
 	}
-}
-
-func TestParseWhisperDecision(t *testing.T) {
-	cases := []struct {
-		in, action, text string
-	}{
-		{`{"action":"reply","text":"yo"}`, "reply", "yo"},
-		{`Sure.\n{"action":"skip"}`, "skip", ""},
-		{`{"action":"reply","text":"Just checking in!"}`, "skip", ""},
-		{`{"action":"reply","text":"As an AI I can help"}`, "skip", ""},
-		{`{"action":"reply","text":""}`, "skip", ""},
-		{`not json at all`, "skip", ""},
-		{"```json\n{\"action\":\"reply\",\"text\":\"sup\"}\n```", "reply", "sup"},
-	}
-	for _, c := range cases {
-		d := protocol.ParseWhisperDecision(c.in)
-		if d.Action != c.action || d.Text != c.text {
-			t.Fatalf("%q → %+v want action=%q text=%q", c.in, d, c.action, c.text)
-		}
+	// A secondary rune cap guards against a runaway line even without a word budget.
+	if got := protocol.ReplyText(strings.Repeat("a", 300), 200); len([]rune(got)) != 200 {
+		t.Fatalf("ReplyText should clip to the rune cap, got %d", len([]rune(got)))
 	}
 }

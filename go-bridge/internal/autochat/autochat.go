@@ -1,5 +1,7 @@
-// Package autochat runs coach-prompt → LLM → JSON reply|skip decisions.
-// Used for whisper, party, and say auto-reply (and their short-circuit CLI clients).
+// Package autochat runs persona-prompt → LLM → reply text for the auto-reply modes.
+// Used for whisper, party and say (and their short-circuit CLI clients). The models
+// no longer decide reply vs skip: the bridge's reply chance decides whether a line
+// is sent to the model at all, and when it is, the model always produces a line.
 package autochat
 
 import (
@@ -15,50 +17,28 @@ type Chatter interface {
 	Chat(ctx context.Context, system, user string, history []llm.Message) (string, error)
 }
 
-// Result is one auto-reply decision after the model responds.
+// Result is one persona reply after the model responds.
 type Result struct {
-	Decision protocol.WhisperDecision
-	Raw      string
-	Text     string // "skip" or the outbound chat body
-	Coach    protocol.Coach
+	Text  string // the line to speak; "" means the model produced nothing usable
+	Raw   string
+	Coach protocol.Coach
 }
 
-// Decide asks the LLM with the given coach rules and returns a structured decision.
-// coach must be CoachWhisper or CoachParty — normal addon chat must not use this path.
-// style carries the optional settings-UI persona tweaks (zero value = as designed).
-// Say mode has its own entry point (DecideSay) because it carries a word budget.
-func Decide(ctx context.Context, client Chatter, coach protocol.Coach, incoming, gameCtx string, history []llm.Message, style protocol.Style) (Result, error) {
-	if coach != protocol.CoachWhisper && coach != protocol.CoachParty {
-		return Result{}, fmt.Errorf("autochat.Decide: coach %q not allowed (use whisper or party only)", coach)
+// Decide asks the LLM with the given persona coach and returns the line to speak.
+// coach must be one of CoachWhisper, CoachParty or CoachSay — normal addon chat must
+// not use this path. maxWords > 0 adds a per-turn word budget (the bridge picks it)
+// and hard-clips the reply to it; profile is the player's "Myself" reference material.
+// An empty Text means there was nothing usable to say, and the caller stays quiet.
+func Decide(ctx context.Context, client Chatter, coach protocol.Coach, incoming, gameCtx string, history []llm.Message, maxWords int, style protocol.Style, profile protocol.Profile) (Result, error) {
+	switch coach {
+	case protocol.CoachWhisper, protocol.CoachParty, protocol.CoachSay:
+	default:
+		return Result{}, fmt.Errorf("autochat.Decide: coach %q not allowed (whisper, party or say only)", coach)
 	}
-	raw, err := client.Chat(ctx, protocol.SystemPrompt(gameCtx, "", coach, style), incoming, history)
+	raw, err := client.Chat(ctx, protocol.BudgetedSystemPrompt(gameCtx, coach, style, profile, maxWords), incoming, history)
 	if err != nil {
 		return Result{}, err
 	}
-	dec := protocol.ParseWhisperDecision(raw)
-	text := "skip"
-	if dec.Action == "reply" {
-		text = dec.Text
-	}
-	return Result{Decision: dec, Raw: raw, Text: text, Coach: coach}, nil
-}
-
-// DecideSay runs the say/scholar-student persona with a per-turn word budget.
-// maxWords is chosen by the caller (the bridge randomizes it). It leans toward
-// replying: a plain line with no JSON wrapper still counts as an answer.
-// style carries the optional settings-UI persona tweaks (zero value = as designed).
-func DecideSay(ctx context.Context, client Chatter, incoming, gameCtx string, history []llm.Message, maxWords int, style protocol.Style) (Result, error) {
-	raw, err := client.Chat(ctx, protocol.SaySystemPrompt(gameCtx, maxWords, style), incoming, history)
-	if err != nil {
-		return Result{}, err
-	}
-	dec := protocol.ParseSayDecision(raw)
-	if dec.Action == "reply" {
-		dec.Text = protocol.ClipWords(dec.Text, maxWords)
-	}
-	text := "skip"
-	if dec.Action == "reply" {
-		text = dec.Text
-	}
-	return Result{Decision: dec, Raw: raw, Text: text, Coach: protocol.CoachSay}, nil
+	text := protocol.ClipWords(protocol.ReplyText(raw, 200), maxWords)
+	return Result{Text: text, Raw: raw, Coach: coach}, nil
 }

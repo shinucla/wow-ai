@@ -40,10 +40,10 @@ type Engine struct {
 	lanes   map[int]*lane
 	handled map[string]map[int]bool // session → ids
 	history map[string][]llm.Message
-	context map[int]string // per-instance game context
-	sayBuf  map[int][]string  // per-instance /say lines waiting for the flush
-	sayChat map[int]string    // per-instance addon chat id the say lines came from
-	sayID   map[int]int       // per-instance id of the newest collected say record
+	context map[int]string   // per-instance game context
+	sayBuf  map[int][]string // per-instance /say lines waiting for the flush
+	sayChat map[int]string   // per-instance addon chat id the say lines came from
+	sayID   map[int]int      // per-instance id of the newest collected say record
 	running bool
 	cancel  context.CancelFunc
 	sem     chan struct{}
@@ -157,36 +157,42 @@ func (e *Engine) Start() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	e.cancel = cancel
 	e.running = true
+	// Take everything this start needs under one lock: the UI can save settings
+	// (ApplyConfig) while Start/Stop are being clicked.
+	cfg := e.Cfg
+	e.ensureLanes()
+	lanes := make([]*lane, 0, len(e.lanes))
+	for _, l := range e.lanes {
+		if l != nil {
+			lanes = append(lanes, l)
+		}
+	}
 	e.mu.Unlock()
 
 	e.debug("bridge starting (multi-instance)")
-	if e.Cfg.AddonDir == "" {
+	if cfg.AddonDir == "" {
 		e.Log("warning: addonDir is empty — set it in Settings")
-	} else if _, err := os.Stat(filepath.Join(e.Cfg.AddonDir, "WoWAI", "WoWAI.toc")); err != nil {
+	} else if _, err := os.Stat(filepath.Join(cfg.AddonDir, "WoWAI", "WoWAI.toc")); err != nil {
 		e.Log("warning: WoWAI addon not found under addonDir")
 	}
-	e.debug(fmt.Sprintf("max instances: %d — each client needs /wow-ai instance N matching window order (left→right)", max(1, e.Cfg.MaxInstances)))
+	e.debug(fmt.Sprintf("max instances: %d — each client needs /wow-ai instance N matching window order (left→right)", max(1, cfg.MaxInstances)))
 
 	// Seed slot clocks so a Connect/hello poll can see the bridge immediately.
-	e.ensureLanes()
-	for i, l := range e.lanes {
-		if l == nil {
-			continue
-		}
+	for i, l := range lanes {
 		if err := l.pub.Refresh(); err != nil {
 			e.Log(fmt.Sprintf("startup slot refresh i%d: %v", i, err))
 		}
 	}
 
 	capCh := make(chan capture.Event, 32)
-	if e.Cfg.Capture.Enabled {
-		proc := e.Cfg.Capture.ProcessName
+	if cfg.Capture.Enabled {
+		proc := cfg.Capture.ProcessName
 		if proc == "" {
 			proc = "Wow"
 		}
 		e.debug(fmt.Sprintf("capture on — watching process %q every %dms (Start required; green light alone is not enough)",
-			proc, max(50, e.Cfg.Capture.IntervalMs)))
-		go capture.NewRunner().Run(ctx, e.Cfg.Capture, e.Cfg.MaxInstances, capCh)
+			proc, max(50, cfg.Capture.IntervalMs)))
+		go capture.NewRunner().Run(ctx, cfg.Capture, cfg.MaxInstances, capCh)
 	} else {
 		e.Log("capture disabled — in-game strip will never be read")
 	}
@@ -226,7 +232,7 @@ func (e *Engine) Running() bool {
 }
 
 func (e *Engine) presenceLoop(ctx context.Context) {
-	iv := time.Duration(e.Cfg.PresenceIntervalMs) * time.Millisecond
+	iv := time.Duration(e.configSnapshot().PresenceIntervalMs) * time.Millisecond
 	if iv < time.Second {
 		iv = 30 * time.Second
 	}
@@ -263,7 +269,7 @@ func (e *Engine) outboxPoll(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			path := e.Cfg.SavedVariablesFile
+			path := e.configSnapshot().SavedVariablesFile
 			if path == "" {
 				continue
 			}
@@ -395,7 +401,7 @@ func (e *Engine) dispatch(ctx context.Context, j protocol.Job) {
 	}
 	e.mark(j)
 	if err := ln.sig.Ack(j.ID); err != nil {
-		e.Log(fmt.Sprintf("ack #%d failed: %v (addonDir=%s)", j.ID, err, e.Cfg.AddonDir))
+		e.Log(fmt.Sprintf("ack #%d failed: %v (addonDir=%s)", j.ID, err, e.configSnapshot().AddonDir))
 	}
 
 	if j.Context {
@@ -517,7 +523,7 @@ func (e *Engine) dropSay(inst int) {
 	ln := e.lane(inst)
 	ln.pub.Publish(fmt.Sprintf("say:%d", inst), protocol.Reply{
 		Chat: chatID, ID: replyID, Status: "done", Text: "",
-		Cwd: e.Cfg.DefaultCwd, Agent: e.LLM.AgentName(), Instance: inst,
+		Cwd: e.configSnapshot().DefaultCwd, Agent: e.LLM.AgentName(), Instance: inst,
 	}, true)
 	_ = ln.sig.Sig(replyID)
 }
@@ -550,21 +556,21 @@ func (e *Engine) runSay(ctx context.Context, inst int, lines []string) {
 	// Random word budget each turn (min..max from settings) so replies vary
 	// instead of all matching.
 	sayCfg := e.configSnapshot()
-	lo, hi := sayCfg.SayWordRange()
+	lo, hi := sayCfg.ModeWordRange("say")
 	maxWords := lo + rand.Intn(hi-lo+1)
-	res, err := autochat.DecideSay(ctx, e.LLM, prompt, gameCtx, hist, maxWords, styleFor(sayCfg, "say"))
+	res, err := autochat.Decide(ctx, e.LLM, protocol.CoachSay, prompt, gameCtx, hist, maxWords, styleFor(sayCfg, "say"), profileFor(sayCfg))
 	if err != nil {
 		e.Log(fmt.Sprintf("say error i%d: %v", inst, err))
 		return
 	}
-	// Show what actually came back, so a "why did it skip?" is answerable from the log.
+	// Show what actually came back, so a "why did it stay quiet?" is answerable from the log.
 	e.debug(fmt.Sprintf("say i%d: %d line(s), maxWords=%d, style=%s, raw reply: %s",
 		inst, len(lines), maxWords, describeStyle(sayCfg, "say"), truncateDebug(res.Raw, 300)))
-	if res.Decision.Action != "reply" || strings.TrimSpace(res.Decision.Text) == "" {
-		e.logGame("say", "to", "(skip)")
+	if strings.TrimSpace(res.Text) == "" {
+		e.logGame("say", "to", "(nothing to say)")
 		return
 	}
-	text := res.Decision.Text
+	text := res.Text
 	e.logGame("say", "to", text)
 
 	e.mu.Lock()
@@ -584,7 +590,7 @@ func (e *Engine) runSay(ctx context.Context, inst int, lines []string) {
 	}
 	ln.pub.Publish(key, protocol.Reply{
 		Chat: chatID, ID: replyID, Status: "done", Text: text,
-		Cwd: e.Cfg.DefaultCwd, Agent: e.LLM.AgentName(), Instance: inst,
+		Cwd: e.configSnapshot().DefaultCwd, Agent: e.LLM.AgentName(), Instance: inst,
 		SayText: text,
 	}, true)
 	ln.sig.Sig(replyID)
@@ -601,7 +607,7 @@ func (e *Engine) runJob(ctx context.Context, j protocol.Job) {
 	ln := e.lane(j.Instance)
 	key := protocol.ChatKey(j)
 	agent := e.LLM.AgentName()
-	cwd := protocol.ResolveCwd(j.Cwd, e.Cfg.DefaultCwd)
+	cwd := protocol.ResolveCwd(j.Cwd, e.configSnapshot().DefaultCwd)
 
 	ln.pub.Publish(key, protocol.Reply{
 		Chat: j.Chat, ID: j.ID, Status: "working", Text: "…", Cwd: cwd, Agent: agent, Instance: j.Instance,
@@ -633,6 +639,22 @@ func (e *Engine) runJob(ctx context.Context, j protocol.Job) {
 		return
 	}
 
+	// Reply-chance roll for the persona modes: a set fraction of incoming lines are
+	// skipped on purpose without asking the model, like say mode's ReplyChance.
+	// Whisper defaults to 100 (always ask), so this only bites when it is lowered.
+	if coach == protocol.CoachWhisper || coach == protocol.CoachParty {
+		mode := jobChannel(j)
+		if pct := e.configSnapshot().ModeReplyChancePct(mode); pct < 100 && rand.Intn(100) >= pct {
+			e.debug(fmt.Sprintf("#%d [%s] reply chance %d%% rolled skip — not asking the model", j.ID, mode, pct))
+			ln.pub.Publish(key, protocol.Reply{
+				Chat: j.Chat, ID: j.ID, Status: "done", Text: "(skipped: reply chance)",
+				Cwd: cwd, Agent: agent, Instance: j.Instance, WhisperAction: "skip",
+			}, true)
+			ln.sig.Sig(j.ID)
+			return
+		}
+	}
+
 	var text string
 	var whisperAction, whisperText string
 	var err error
@@ -643,20 +665,25 @@ func (e *Engine) runJob(ctx context.Context, j protocol.Job) {
 		e.debug(fmt.Sprintf("#%d [say] single say line reached runJob — ignored (collector owns say mode)", j.ID))
 		return
 	case protocol.CoachWhisper, protocol.CoachParty:
-		// Auto-whisper / auto-party — persona JSON coaches.
+		// Auto-whisper / auto-party — persona coaches that always produce a line.
 		mode := jobChannel(j)
 		modeCfg := e.configSnapshot()
 		e.debug(fmt.Sprintf("#%d [%s] persona coach (not assist), style=%s", j.ID, mode, describeStyle(modeCfg, mode)))
+		lo, hi := modeCfg.ModeWordRange(mode)
+		maxWords := lo + rand.Intn(hi-lo+1)
 		var res autochat.Result
-		res, err = autochat.Decide(ctx, e.LLM, coach, j.Text, gameCtx, hist, styleFor(modeCfg, mode))
+		res, err = autochat.Decide(ctx, e.LLM, coach, j.Text, gameCtx, hist, maxWords, styleFor(modeCfg, mode), profileFor(modeCfg))
 		if err == nil {
-			text = res.Text
-			whisperAction = res.Decision.Action
-			whisperText = res.Decision.Text
-			if res.Decision.Action == "reply" {
-				e.logGame(mode, "to", res.Decision.Text)
+			// Show what actually came back, so a "why nothing spoken?" is answerable from the log.
+			e.debug(fmt.Sprintf("#%d [%s] maxWords=%d, raw reply: %s", j.ID, mode, maxWords, truncateDebug(res.Raw, 300)))
+			if line := strings.TrimSpace(res.Text); line != "" {
+				text = line
+				whisperAction = "reply"
+				whisperText = line
+				e.logGame(mode, "to", line)
 			} else {
-				e.logGame(mode, "to", "(skip)")
+				whisperAction = "skip"
+				e.logGame(mode, "to", "(nothing to say)")
 			}
 		}
 	default:
@@ -730,11 +757,21 @@ func jobChannel(j protocol.Job) string {
 
 // styleFor turns the settings-UI dropdowns for a mode into a protocol.Style.
 func styleFor(cfg config.Config, mode string) protocol.Style {
-	personality, education, characteristics := cfg.ModeStyle(mode)
+	personality, education, characteristics, slang := cfg.ModeStyle(mode)
 	return protocol.Style{
 		Personality:     personality,
 		Education:       education,
 		Characteristics: characteristics,
+		Slang:           slang,
+	}
+}
+
+// profileFor turns the "Myself" tab fields into a protocol.Profile.
+func profileFor(cfg config.Config) protocol.Profile {
+	return protocol.Profile{
+		About:     cfg.Profile.About,
+		Interests: cfg.Profile.Interests,
+		Opinions:  cfg.Profile.Opinions,
 	}
 }
 

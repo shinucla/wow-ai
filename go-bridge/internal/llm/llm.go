@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chelinho139/wow-ai/go-bridge/internal/config"
@@ -19,6 +20,7 @@ type Message struct {
 }
 
 type Client struct {
+	mu     sync.RWMutex
 	cfg    config.LLMConfig
 	http   *http.Client
 	primer string
@@ -32,30 +34,42 @@ func New(cfg config.LLMConfig, primer string) *Client {
 	}
 }
 
-func (c *Client) Update(cfg config.LLMConfig) { c.cfg = cfg }
+// Update swaps the settings under a lock: jobs read the config concurrently from
+// several goroutines while the UI can save new settings at any time.
+func (c *Client) Update(cfg config.LLMConfig) {
+	c.mu.Lock()
+	c.cfg = cfg
+	c.mu.Unlock()
+}
+
+func (c *Client) snapshot() config.LLMConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cfg
+}
 
 func (c *Client) AgentName() string {
-	if c.cfg.AgentName != "" {
-		return c.cfg.AgentName
+	if name := c.snapshot().AgentName; name != "" {
+		return name
 	}
 	return "api"
 }
 
 // Chat sends a user prompt with optional system context and returns assistant text.
 func (c *Client) Chat(ctx context.Context, system, user string, history []Message) (string, error) {
-	if strings.TrimSpace(c.cfg.APIKey) == "" {
+	cfg := c.snapshot()
+	if strings.TrimSpace(cfg.APIKey) == "" {
 		return "", fmt.Errorf("API key is empty — set it in Settings")
 	}
-	provider := strings.ToLower(c.cfg.Provider)
-	switch provider {
+	switch strings.ToLower(cfg.Provider) {
 	case "anthropic":
-		return c.chatAnthropic(ctx, system, user, history)
+		return c.chatAnthropic(ctx, cfg, system, user, history)
 	default:
-		return c.chatOpenAI(ctx, system, user, history)
+		return c.chatOpenAI(ctx, cfg, system, user, history)
 	}
 }
 
-func (c *Client) chatOpenAI(ctx context.Context, system, user string, history []Message) (string, error) {
+func (c *Client) chatOpenAI(ctx context.Context, cfg config.LLMConfig, system, user string, history []Message) (string, error) {
 	msgs := make([]Message, 0, len(history)+2)
 	if system != "" {
 		msgs = append(msgs, Message{Role: "system", Content: system})
@@ -64,21 +78,21 @@ func (c *Client) chatOpenAI(ctx context.Context, system, user string, history []
 	msgs = append(msgs, Message{Role: "user", Content: user})
 
 	body := map[string]interface{}{
-		"model":       c.cfg.Model,
+		"model":       cfg.Model,
 		"messages":    msgs,
-		"max_tokens":  c.cfg.MaxTokens,
-		"temperature": c.cfg.Temperature,
+		"max_tokens":  cfg.MaxTokens,
+		"temperature": cfg.Temperature,
 	}
-	base := strings.TrimRight(c.cfg.BaseURL, "/")
+	base := strings.TrimRight(cfg.BaseURL, "/")
 	if base == "" {
-		if strings.EqualFold(c.cfg.Provider, "deepseek") {
+		if strings.EqualFold(cfg.Provider, "deepseek") {
 			base = "https://api.deepseek.com/v1"
 		} else {
 			base = "https://api.openai.com/v1"
 		}
 	}
 	return c.postJSON(ctx, base+"/chat/completions", map[string]string{
-		"Authorization": "Bearer " + c.cfg.APIKey,
+		"Authorization": "Bearer " + cfg.APIKey,
 		"Content-Type":  "application/json",
 	}, body, func(raw []byte) (string, error) {
 		var resp struct {
@@ -104,7 +118,7 @@ func (c *Client) chatOpenAI(ctx context.Context, system, user string, history []
 	})
 }
 
-func (c *Client) chatAnthropic(ctx context.Context, system, user string, history []Message) (string, error) {
+func (c *Client) chatAnthropic(ctx context.Context, cfg config.LLMConfig, system, user string, history []Message) (string, error) {
 	type amsg struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
@@ -123,14 +137,14 @@ func (c *Client) chatAnthropic(ctx context.Context, system, user string, history
 	msgs = append(msgs, amsg{Role: "user", Content: user})
 
 	body := map[string]interface{}{
-		"model":      c.cfg.Model,
-		"max_tokens": c.cfg.MaxTokens,
+		"model":      cfg.Model,
+		"max_tokens": cfg.MaxTokens,
 		"messages":   msgs,
 	}
 	if system != "" {
 		body["system"] = system
 	}
-	base := strings.TrimRight(c.cfg.BaseURL, "/")
+	base := strings.TrimRight(cfg.BaseURL, "/")
 	if base == "" || strings.Contains(base, "openai.com") {
 		base = "https://api.anthropic.com"
 	}
@@ -139,7 +153,7 @@ func (c *Client) chatAnthropic(ctx context.Context, system, user string, history
 		url = base + "/messages"
 	}
 	return c.postJSON(ctx, url, map[string]string{
-		"x-api-key":         c.cfg.APIKey,
+		"x-api-key":         cfg.APIKey,
 		"anthropic-version": "2023-06-01",
 		"Content-Type":      "application/json",
 	}, body, func(raw []byte) (string, error) {

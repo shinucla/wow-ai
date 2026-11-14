@@ -231,7 +231,7 @@ func (a *App) handleInject(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"ok": "injected", "id": id, "instance": inst})
 }
 
-// handleStyleOptions serves the personality/education/characteristics catalogs
+// handleStyleOptions serves the personality/education/characteristics/slang catalogs
 // straight from the protocol package, so the UI dropdowns and the prompt builder
 // can never disagree about what a key means.
 func (a *App) handleStyleOptions(w http.ResponseWriter, r *http.Request) {
@@ -246,6 +246,7 @@ func (a *App) handleStyleOptions(w http.ResponseWriter, r *http.Request) {
 		"personalities":   toJSON(protocol.Personalities),
 		"education":       toJSON(protocol.EducationLevels),
 		"characteristics": toJSON(protocol.Characteristics),
+		"slang":           toJSON(protocol.SlangLevels),
 	})
 }
 

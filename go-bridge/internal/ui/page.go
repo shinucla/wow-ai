@@ -97,6 +97,7 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
     <button type="button" data-tab="whisper">Whisper mode</button>
     <button type="button" data-tab="party">Party mode</button>
     <button type="button" data-tab="say">Say mode</button>
+    <button type="button" data-tab="myself">Myself</button>
     <button type="button" data-tab="logging">Logging</button>
   </nav>
 </header>
@@ -185,6 +186,19 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
           Auto-reply to whispers (bridge master switch)
         </label>
         <p class="hint">When off, the bridge ignores whisper auto-reply jobs and answers &quot;skip&quot;, so nothing is spoken. The in-game <b>Auto-whisper</b> checkbox still decides whether the addon sends a whisper at all — a private whisper is never answered unless that is on.</p>
+        <label>Reply chance (%)
+          <input name="whisperReplyChance" id="whisperReplyChance" type="number" min="0" max="100"/>
+        </label>
+        <p class="hint">Share of whispers the persona answers; the rest are skipped on the bridge side without asking the model. 100 = answer every whisper.</p>
+        <div class="two-col">
+          <label>Min words per reply
+            <input name="whisperMinWords" id="whisperMinWords" type="number" min="1" max="100"/>
+          </label>
+          <label>Max words per reply
+            <input name="whisperMaxWords" id="whisperMaxWords" type="number" min="1" max="100"/>
+          </label>
+        </div>
+        <p class="hint">Each reply picks a random length between min and max, so answers vary instead of all matching.</p>
         <div class="section-title">Reply style</div>
         <div class="two-col">
           <label>Personality
@@ -197,6 +211,9 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
         <label>Characteristics
           <select id="whisperCharacteristics"></select>
         </label>
+        <label>Slang level
+          <select id="whisperSlang"></select>
+        </label>
         <p class="hint">Optional. These only bend tone and word choice — the persona's rules, the length limit, and the &quot;never sound like an AI&quot; rule all still apply. Leave them on Default to keep the voice exactly as designed.</p>
       </div>
     </section>
@@ -208,6 +225,19 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
           Auto-reply in party chat (bridge master switch)
         </label>
         <p class="hint">When off, the bridge ignores party auto-reply jobs and answers &quot;skip&quot;. The in-game <b>Auto-party</b> checkbox still decides whether the addon sends a party line at all.</p>
+        <label>Reply chance (%)
+          <input name="partyReplyChance" id="partyReplyChance" type="number" min="0" max="100"/>
+        </label>
+        <p class="hint">Share of party lines the persona answers; the rest are skipped on the bridge side without asking the model. 100 = answer every party line.</p>
+        <div class="two-col">
+          <label>Min words per reply
+            <input name="partyMinWords" id="partyMinWords" type="number" min="1" max="100"/>
+          </label>
+          <label>Max words per reply
+            <input name="partyMaxWords" id="partyMaxWords" type="number" min="1" max="100"/>
+          </label>
+        </div>
+        <p class="hint">Each reply picks a random length between min and max, so answers vary instead of all matching.</p>
         <div class="section-title">Reply style</div>
         <div class="two-col">
           <label>Personality
@@ -219,6 +249,9 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
         </div>
         <label>Characteristics
           <select id="partyCharacteristics"></select>
+        </label>
+        <label>Slang level
+          <select id="partySlang"></select>
         </label>
         <p class="hint">Optional. These only bend tone and word choice — the persona's rules, the length limit, and the &quot;never sound like an AI&quot; rule all still apply. Leave them on Default to keep the voice exactly as designed.</p>
       </div>
@@ -261,7 +294,25 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
         <label>Characteristics
           <select id="sayCharacteristics"></select>
         </label>
+        <label>Slang level
+          <select id="saySlang"></select>
+        </label>
         <p class="hint">Optional. These only bend tone and word choice — the persona's rules, the word budget, and the &quot;never sound like an AI&quot; rule all still apply. Leave them on Default to keep the voice exactly as designed.</p>
+      </div>
+    </section>
+
+    <section id="tab-myself" class="tab">
+      <div class="form-grid">
+        <p class="hint">Background about the real you. The whisper, party and say personas read this so they sound like the same person across chats, and so questions like &quot;what do you think of that guild?&quot; get your actual view instead of an invented one. This is reference and facts only — tone and slang come from each mode tab's Reply style. Leave anything blank to skip it.</p>
+        <label>Who I am
+          <textarea name="profileAbout" id="profileAbout" rows="2" placeholder="age, work or study, region, how long I've played, main character and class"></textarea>
+        </label>
+        <label>Interests &amp; hobbies
+          <textarea name="profileInterests" id="profileInterests" rows="2" placeholder="what I do for fun, favourite games, films, music, food, outdoor stuff"></textarea>
+        </label>
+        <label>Opinions &amp; hot takes
+          <textarea name="profileOpinions" id="profileOpinions" rows="3" placeholder="what I think about guilds, classes, servers, game changes, pet peeves"></textarea>
+        </label>
       </div>
     </section>
 
@@ -284,7 +335,7 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
 <script>
 const $ = (id) => document.getElementById(id);
 
-const SETTINGS_TABS = ['game','llm','whisper','party','say','logging'];
+const SETTINGS_TABS = ['game','llm','whisper','party','say','myself','logging'];
 
 const PROVIDERS = {
   openai:              { base: 'https://api.openai.com/v1',   model: 'gpt-4o-mini',              hint: 'e.g. gpt-4o-mini, gpt-4o' },
@@ -324,7 +375,7 @@ $('provider').onchange = () => applyProviderPreset(false);
 // The personality/education/characteristics dropdowns are filled from the same
 // Go catalogs the prompt builder uses, so labels can never drift from behaviour.
 const STYLE_MODES = ['whisper', 'party', 'say'];
-const STYLE_FIELDS = [['Personality', 'personalities'], ['Education', 'education'], ['Characteristics', 'characteristics']];
+const STYLE_FIELDS = [['Personality', 'personalities'], ['Education', 'education'], ['Characteristics', 'characteristics'], ['Slang', 'slang']];
 
 async function fillStyleSelects() {
   let opts;
@@ -353,6 +404,7 @@ function readStyle(mode) {
     personality: $(mode + 'Personality').value,
     education: $(mode + 'Education').value,
     characteristics: $(mode + 'Characteristics').value,
+    slang: $(mode + 'Slang').value,
   };
 }
 
@@ -361,6 +413,7 @@ function applyStyle(mode, s) {
   $(mode + 'Personality').value = m.personality || '';
   $(mode + 'Education').value = m.education || '';
   $(mode + 'Characteristics').value = m.characteristics || '';
+  $(mode + 'Slang').value = m.slang || '';
 }
 
 async function refresh() {
@@ -403,15 +456,26 @@ async function loadConfig() {
   const m = c.modes || {};
   const mw = m.whisper || {}, mp = m.party || {}, ms = m.say || {};
   $('whisperEnabled').checked = mw.enabled !== false;
+  $('whisperReplyChance').value = (mw.replyChance != null) ? mw.replyChance : 100;
+  $('whisperMinWords').value = (mw.minWords != null) ? mw.minWords : 4;
+  $('whisperMaxWords').value = (mw.maxWords != null) ? mw.maxWords : 13;
   $('partyEnabled').checked = mp.enabled !== false;
+  $('partyReplyChance').value = (mp.replyChance != null) ? mp.replyChance : 100;
+  $('partyMinWords').value = (mp.minWords != null) ? mp.minWords : 4;
+  $('partyMaxWords').value = (mp.maxWords != null) ? mp.maxWords : 13;
   $('sayEnabled').checked = ms.enabled !== false;
-  $('sayReplyChance').value = (ms.replyChance != null) ? ms.replyChance : 50;
+  $('sayReplyChance').value = (ms.replyChance != null) ? ms.replyChance : 100;
   $('sayCollectSeconds').value = (ms.collectSeconds != null) ? ms.collectSeconds : 10;
   $('sayMinWords').value = (ms.minWords != null) ? ms.minWords : 4;
   $('sayMaxWords').value = (ms.maxWords != null) ? ms.maxWords : 13;
   applyStyle('whisper', mw);
   applyStyle('party', mp);
   applyStyle('say', ms);
+
+  const p = c.profile || {};
+  $('profileAbout').value = p.about || '';
+  $('profileInterests').value = p.interests || '';
+  $('profileOpinions').value = p.opinions || '';
 
   $('debug').checked = !!c.debug;
 }
@@ -439,11 +503,21 @@ $('settings').onsubmit = async (e) => {
   cur.llm.temperature = num('temperature', 0.7);
 
   cur.modes = {
-    whisper: Object.assign({ enabled: $('whisperEnabled').checked }, readStyle('whisper')),
-    party:   Object.assign({ enabled: $('partyEnabled').checked }, readStyle('party')),
+    whisper: Object.assign({
+      enabled: $('whisperEnabled').checked,
+      replyChance: num('whisperReplyChance', 100),
+      minWords: num('whisperMinWords', 4),
+      maxWords: num('whisperMaxWords', 13),
+    }, readStyle('whisper')),
+    party:   Object.assign({
+      enabled: $('partyEnabled').checked,
+      replyChance: num('partyReplyChance', 100),
+      minWords: num('partyMinWords', 4),
+      maxWords: num('partyMaxWords', 13),
+    }, readStyle('party')),
     say: Object.assign({
       enabled: $('sayEnabled').checked,
-      replyChance: num('sayReplyChance', 50),
+      replyChance: num('sayReplyChance', 100),
       collectSeconds: num('sayCollectSeconds', 10),
       minWords: num('sayMinWords', 4),
       maxWords: num('sayMaxWords', 13),
@@ -451,6 +525,12 @@ $('settings').onsubmit = async (e) => {
   };
 
   cur.debug = $('debug').checked;
+
+  cur.profile = {
+    about: $('profileAbout').value.trim(),
+    interests: $('profileInterests').value.trim(),
+    opinions: $('profileOpinions').value.trim(),
+  };
 
   const res = await fetch('/api/config', {
     method: 'POST',

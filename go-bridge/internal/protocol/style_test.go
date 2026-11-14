@@ -13,7 +13,7 @@ func TestZeroStyleAddsNothing(t *testing.T) {
 			t.Fatalf("%s: zero style must not add a style block", coach)
 		}
 	}
-	if got := SaySystemPrompt("", 7, Style{}); strings.Contains(got, "Reply style") {
+	if got := BudgetedSystemPrompt("", CoachSay, Style{}, Profile{}, 7); strings.Contains(got, "Reply style") {
 		t.Fatal("say: zero style must not add a style block")
 	}
 	if !(Style{}).IsZero() {
@@ -53,13 +53,27 @@ func TestStyleClauseIgnoresUnknownKeys(t *testing.T) {
 	}
 }
 
-func TestSaySystemPromptKeepsBudgetWithStyle(t *testing.T) {
-	got := SaySystemPrompt("", 6, Style{Personality: "friendly"})
+func TestBudgetedSystemPromptKeepsBudgetWithStyle(t *testing.T) {
+	got := BudgetedSystemPrompt("", CoachSay, Style{Personality: "friendly"}, Profile{}, 6)
 	if !strings.Contains(got, "at most 6 words") {
 		t.Fatal("word budget must survive a style tweak")
 	}
 	if !strings.Contains(got, "warm and friendly") {
 		t.Fatal("style clause missing from the say prompt")
+	}
+}
+
+// The slang level bends word choice only, and reaches the prompt like the others.
+func TestSlangLevelReachesPrompt(t *testing.T) {
+	got := BudgetedSystemPrompt("", CoachParty, Style{Slang: "none"}, Profile{}, 0)
+	if !strings.Contains(got, "Slang level: Never use slang") {
+		t.Fatalf("slang level missing from the prompt:\n%s", got)
+	}
+	if !strings.Contains(got, "only adjusts tone and word choice") || !strings.Contains(got, "composed and steady") {
+		t.Fatal("slang must not displace the persona or its rules")
+	}
+	if (Style{Slang: "none"}).IsZero() {
+		t.Fatal("a set slang level must make IsZero false")
 	}
 }
 
@@ -69,6 +83,7 @@ func TestStyleCatalogsAreWellFormed(t *testing.T) {
 		"personalities":   Personalities,
 		"education":       EducationLevels,
 		"characteristics": Characteristics,
+		"slang":           SlangLevels,
 	} {
 		if len(opts) == 0 || opts[0].Key != "" {
 			t.Fatalf("%s must offer a default option first", name)

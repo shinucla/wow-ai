@@ -22,26 +22,32 @@ func (s *stubChat) Chat(_ context.Context, system, user string, _ []llm.Message)
 }
 
 func TestDecideReply(t *testing.T) {
-	s := &stubChat{raw: `{"action":"reply","text":"do your research"}`}
+	s := &stubChat{raw: `{"text":"do your research"}`}
 	r, err := whisper.Decide(context.Background(), s, "best unholy build?", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Decision.Action != "reply" || r.Decision.Text != "do your research" || r.Text != "do your research" {
+	if r.Text != "do your research" {
 		t.Fatalf("%+v", r)
 	}
-	if s.user != "best unholy build?" || !strings.Contains(s.sys, "NEVER skip a question") {
+	if s.user != "best unholy build?" || !strings.Contains(s.sys, "always reply") {
 		t.Fatalf("sys=%q user=%q", s.sys, s.user)
+	}
+	// The model is no longer offered a reply/skip decision.
+	if strings.Contains(s.sys, `"action"`) {
+		t.Fatalf("whisper prompt must not ask the model for an action:\n%s", s.sys)
 	}
 }
 
-func TestDecideSkip(t *testing.T) {
-	s := &stubChat{raw: `{"action":"skip"}`}
-	r, err := whisper.Decide(context.Background(), s, "WTS gold cheap http://x", "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Decision.Action != "skip" || r.Text != "skip" {
-		t.Fatalf("%+v", r)
+func TestDecideWithNoUsableAnswerStaysQuiet(t *testing.T) {
+	for _, raw := range []string{`{"text":""}`, `{"action":"skip"}`, `As an AI I cannot.`} {
+		s := &stubChat{raw: raw}
+		r, err := whisper.Decide(context.Background(), s, "WTS gold cheap http://x", "", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Text != "" {
+			t.Fatalf("%q should yield no line, got %+v", raw, r)
+		}
 	}
 }
